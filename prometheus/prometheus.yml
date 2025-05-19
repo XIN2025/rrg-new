@@ -1,0 +1,9 @@
+# prometheus.yml
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: 'generic_scraper_8000'
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['172.17.0.1:8000']   # will have to change to ip of server in prod

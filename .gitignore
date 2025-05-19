@@ -1,0 +1,36 @@
+# Virtual Environment
+.venv/
+venv/
+ENV/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Large binary files
+*.so
+*.duckdb
+*.db
+*.sqlite3
+
+# Specific large files mentioned in the error
+data/pydb.duckdb
+.venv/lib/python3.11/site-packages/polars/polars.abi3.so
+.venv/lib/python3.11/site-packages/pyarrow/libarrow.so.1900
+.venv/lib/python3.11/site-packages/connectorx/connectorx.cpython-311-x86_64-linux-gnu.so
+.venv/lib/python3.11/site-packages/duckdb/duckdb.cpython-311-x86_64-linux-gnu.so
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log 
