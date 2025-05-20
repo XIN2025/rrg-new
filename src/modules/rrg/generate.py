@@ -16,13 +16,7 @@ from src.utils.metrics import (
 )
 from src.utils.logger import get_logger
 from src.utils.duck_pool import get_duckdb_connection
-# Import our metadata and price data store
-from src.modules.rrg.metadata_store import (
-    get_indices, get_indices_stocks, get_companies, 
-    get_stocks, get_market_metadata as get_md,
-    get_metadata_status, get_stock_prices, get_eod_stock_data,
-    get_price_data_status
-)
+from src.modules.rrg.metadata_store import RRGMetadataStore
 from src.modules.rrg.time_utils import return_filter_days, split_time
 
 # Get logger for this module
@@ -34,7 +28,8 @@ def get_market_metadata(symbol) -> pl.DataFrame:
         try:
             start_time = t.time()
             logger.debug(f"Getting market metadata for {len(symbol) if isinstance(symbol, list) else 1} symbols")
-            metadata_df = get_md(symbols=symbol)
+            metadata_store = RRGMetadataStore()
+            metadata_df = metadata_store.get_market_metadata(symbols=symbol)
             
             record_rrg_data_points(len(metadata_df), "market_metadata")
             logger.info(f"Market metadata retrieval completed in {t.time() - start_time:.2f}s ({len(metadata_df)} rows)")
@@ -89,7 +84,8 @@ def generate_csv(tickers, date_range, index_symbol, timeframe, channel_name, fil
             raise ValueError("No market metadata found")
             
         # Get price data
-        price_data = get_stock_prices(tickers, date_range, timeframe)
+        metadata_store = RRGMetadataStore()
+        price_data = metadata_store.get_stock_prices(tickers, timeframe, date_range)
         if price_data.is_empty():
             raise ValueError("No price data found")
             
@@ -706,3 +702,123 @@ def aggregate_monthly(df: pl.DataFrame):
             record_rrg_error("monthly_aggregation")
             logger.error(f"Error in monthly aggregation: {str(e)}", exc_info=True)
             raise
+
+def format_numeric(value, decimals=6):
+    """Format numeric value to specified decimal places."""
+    try:
+        return f"{float(value):.{decimals}f}"
+    except (ValueError, TypeError):
+        return "0.000000"
+
+def create_datalist_item(symbol, data_points):
+    """Create a properly formatted datalist item."""
+    return {
+        "symbol": symbol,
+        "data": [
+            {
+                "date": point["date"],
+                "time": point["time"],
+                "open": format_numeric(point.get("open", 0)),
+                "high": format_numeric(point.get("high", 0)),
+                "low": format_numeric(point.get("low", 0)),
+                "close": format_numeric(point.get("close", 0)),
+                "volume": format_numeric(point.get("volume", 0)),
+                "value": format_numeric(point.get("value", 0)),
+                "trades": format_numeric(point.get("trades", 0))
+            }
+            for point in data_points
+        ]
+    }
+
+def generate_rrg_data(symbols, timeframe="daily", filter_days=None):
+    """Generate RRG data for the given symbols."""
+    try:
+        logger.info(f"[RRG Generate] Starting data generation for {len(symbols)} symbols")
+        
+        # Initialize metadata store
+        metadata_store = RRGMetadataStore()
+        
+        # Get price data
+        price_data = metadata_store.get_stock_prices(symbols, timeframe, filter_days)
+        
+        if price_data is None or len(price_data) == 0:
+            logger.error("[RRG Generate] No price data available")
+            return {
+                "status": "error",
+                "message": "No price data available"
+            }
+            
+        # Convert to proper format
+        formatted_data = []
+        for symbol in symbols:
+            symbol_data = price_data.filter(pl.col("symbol") == symbol)
+            if len(symbol_data) > 0:
+                data_points = []
+                for row in symbol_data.iter_rows(named=True):
+                    # Convert created_at to string format
+                    created_at_str = row["created_at"].strftime("%Y-%m-%d %H:%M:%S")
+                    # Split date and time directly
+                    date = created_at_str.split()[0]
+                    time = created_at_str.split()[1]
+                    data_points.append({
+                        "date": date,
+                        "time": time,
+                        "open": row.get("open_price", row["close_price"]),
+                        "high": row.get("high_price", row["close_price"]),
+                        "low": row.get("low_price", row["close_price"]),
+                        "close": row["close_price"],
+                        "volume": row.get("volume", 0),
+                        "value": row.get("value", 0),
+                        "trades": row.get("trades", 0)
+                    })
+                formatted_data.append(create_datalist_item(symbol, data_points))
+        
+        if not formatted_data:
+            return {
+                "status": "error",
+                "message": "No data points found for any symbols"
+            }
+        
+        # Create response structure
+        response = {
+            "status": "success",
+            "data": {
+                "datalist": formatted_data
+            }
+        }
+        
+        logger.info(f"[RRG Generate] Successfully generated data for {len(formatted_data)} symbols")
+        return response
+        
+    except Exception as e:
+        error_msg = f"[RRG Generate] Error generating data: {str(e)}"
+        logger.error(error_msg)
+        return {
+            "status": "error",
+            "message": error_msg
+        }
+
+def save_rrg_data(data, output_dir):
+    """Save RRG data to files."""
+    try:
+        # Create output directory if it doesn't exist
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Save JSON response
+        json_path = os.path.join(output_dir, "response.json")
+        with open(json_path, "w") as f:
+            json.dump(data, f, indent=2)
+            
+        # Save CSV files for each symbol
+        for item in data["data"]["datalist"]:
+            symbol = item["symbol"]
+            df = pl.DataFrame(item["data"])
+            csv_path = os.path.join(output_dir, f"{symbol}.csv")
+            df.write_csv(csv_path)
+            
+        logger.info(f"[RRG Generate] Data saved to {output_dir}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"[RRG Generate] Error saving data: {str(e)}")
+        return False
