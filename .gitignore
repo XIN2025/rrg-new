@@ -37,4 +37,7 @@ build/
 
 # RRG generated files
 src/modules/rrg/exports/input/
-src/modules/rrg/exports/output/ 
+src/modules/rrg/exports/output/
+
+# Celery files
+celerybeat-schedule

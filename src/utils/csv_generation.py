@@ -1,4 +1,5 @@
 import polars as pl
+import pandas as pd
 from datetime import datetime
 import os
 import time
@@ -158,54 +159,115 @@ def write_csv(df, rrg_csv_filepath, input_folder_path):
 
 
 def generate_csv(df: pl.DataFrame, ticker, input_file_name, input_folder_path):
-    """Generate CSV file with proper metadata and data quality checks."""
-    logger.info(f"[RRG][CSV GENERATOR] Starting CSV generation for ticker: {ticker}")
+    print(f"[RRG][CSV GENERATOR] Initiate Generating Csv File.")
     
-    # Validate input data
-    if df.is_empty():
-        logger.error("Input DataFrame is empty")
-        return None
-
-    required_columns = ['symbol', 'name', 'slug', 'created_at', 'close_price']
-    missing_columns = [col for col in required_columns if col not in df.columns]
-    if missing_columns:
-        logger.error(f"Missing required columns: {missing_columns}")
-        return None
-
     try:
-        # Process data
-        input_df = df[required_columns]
-        input_df = attach_url_and_standardized_name(input_df)
+        # Get benchmark name from the input DataFrame
+        benchmark_rows = df.filter(pl.col("symbol") == ticker)
+        if len(benchmark_rows) == 0:
+            raise ValueError(f"Benchmark symbol {ticker} not found in data")
+        benchmark_name = benchmark_rows["name"].unique()[0]
         
-        # Generate metadata and market data
-        metadata_df = transform_to_metadata_df(input_df, ticker)
-        marketdata_df = transform_to_marketdata_df(input_df, ticker)
+        # Get all unique symbols and sort them with benchmark first
+        all_symbols = df["symbol"].unique().sort()
+        benchmark_first = [ticker] + [s for s in all_symbols if s != ticker]
         
-        if marketdata_df.is_empty():
-            logger.error("Failed to generate market data")
-            return None
-            
-        # Backfill missing values
-        backfilled_marketdata_df = backfill_marketdata_df(marketdata_df)
+        # Create header row with benchmark in first column
+        header_row = {"column1": "Date"}
+        for sym in benchmark_first:
+            # Keep spaces in header as is
+            header_row[sym] = sym
+        header_df = pl.DataFrame([header_row])
         
-        # Create header
-        header_df = pl.DataFrame({col: [ticker if col == "column1" else ""] for col in metadata_df.columns})
+        # Create market data rows
+        marketdata_df = df.pivot(
+            values="close_price",
+            index="created_at",
+            columns="symbol",
+            aggregate_function="first"
+        ).sort("created_at")
         
-        # Combine all parts
-        rrg_csv_df = pl.concat([header_df, metadata_df, backfilled_marketdata_df], how="vertical_relaxed")
+        # Rename created_at to column1
+        marketdata_df = marketdata_df.rename({"created_at": "column1"})
         
-        # Write to CSV using Polars' write_csv
-        os.makedirs(input_folder_path, exist_ok=True)
-        rrg_csv_filepath = f"{input_folder_path}/{input_file_name}.csv"
-        rrg_csv_df.write_csv(
-            rrg_csv_filepath,
-            separator="\t",
-            has_header=False
+        # Ensure columns are in correct order: column1, benchmark, other symbols
+        market_cols = ["column1"] + benchmark_first
+        marketdata_df = marketdata_df.select(market_cols)
+        
+        # Forward fill any missing values
+        marketdata_df = marketdata_df.fill_null(strategy="forward")
+        
+        # Format dates to match expected format
+        marketdata_df = marketdata_df.with_columns(
+            pl.col("column1").dt.strftime("%Y-%m-%d %H:%M:%S").alias("column1")
         )
         
-        logger.info(f"[RRG][CSV GENERATOR] Successfully created CSV file: {rrg_csv_filepath}")
+        # Combine all dataframes
+        rrg_csv_df = pl.concat([header_df, marketdata_df], how="vertical_relaxed")
+        
+        # Create input directory if it doesn't exist
+        os.makedirs(input_folder_path, exist_ok=True, mode=0o755)
+        
+        # Write to CSV with comma separation
+        rrg_csv_filepath = os.path.join(input_folder_path, f"{input_file_name}.csv")
+        
+        # Write to CSV without header and with proper formatting
+        rrg_csv_df.write_csv(
+            rrg_csv_filepath,
+            separator=",",
+            quote='"',
+            has_header=False,
+            null_value="",
+            datetime_format="%Y-%m-%d %H:%M:%S"
+        )
+        
+        # Verify the file was created and has content
+        if not os.path.exists(rrg_csv_filepath):
+            raise ValueError(f"Failed to create CSV file at {rrg_csv_filepath}")
+            
+        if os.path.getsize(rrg_csv_filepath) == 0:
+            raise ValueError(f"Generated CSV file is empty at {rrg_csv_filepath}")
+            
+        # Set proper permissions
+        os.chmod(rrg_csv_filepath, 0o644)
+        
+        # Verify CSV content
+        with open(rrg_csv_filepath, 'r') as f:
+            content = f.read()
+            if not content.strip():
+                raise ValueError("CSV file is empty")
+            
+            # Split into lines and verify each line
+            lines = content.strip().split('\n')
+            if not lines:
+                raise ValueError("CSV file has no content")
+                
+            # Get expected number of columns from header
+            header = lines[0]
+            expected_columns = len(header.split(','))
+            print(f"[DEBUG] Expected columns: {expected_columns}")
+            
+            # Verify each line has the correct number of columns
+            for i, line in enumerate(lines[1:], 1):
+                columns = line.split(',')
+                if len(columns) != expected_columns:
+                    print(f"[DEBUG] Line {i} has {len(columns)} columns, expected {expected_columns}")
+                    print(f"[DEBUG] Line content: {line}")
+                    raise ValueError(f"CSV file has inconsistent number of columns at line {i}")
+            
+            # Verify no line ends with a comma
+            for i, line in enumerate(lines[1:], 1):
+                if line.endswith(','):
+                    print(f"[DEBUG] Line {i} ends with a comma: {line}")
+                    raise ValueError(f"CSV file has trailing comma at line {i}")
+        
+        print(f"[RRG][CSV GENERATOR] Created csv file: {rrg_csv_filepath}")
+        print(f"[DEBUG] CSV file contents preview:")
+        with open(rrg_csv_filepath, 'r') as f:
+            print(f.read()[:500])  # Print first 500 chars for debugging
+            
         return rrg_csv_filepath
         
     except Exception as e:
-        logger.error(f"[RRG][CSV GENERATOR] Error generating CSV: {str(e)}", exc_info=True)
-        return None
+        logger.error(f"Error generating CSV file: {str(e)}", exc_info=True)
+        raise

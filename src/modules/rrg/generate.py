@@ -45,115 +45,145 @@ def get_market_metadata(symbol) -> pl.DataFrame:
 
 
 def generate_csv(tickers, date_range, index_symbol, timeframe, channel_name, filename, cache_manager):
-    """Generate CSV file for RRG processing."""
     try:
-        logger.debug(f"Generating CSV for {len(tickers)} tickers with timeframe {timeframe}")
+        # Get absolute paths - use the correct project root
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.abspath(os.path.join(current_dir, "../../.."))  # Fixed: go up 3 levels instead of 4
+        
+        # Create unique folder for this run
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        input_folder_name = f"rrg_{timestamp}"
+        
+        # Set input and output paths relative to project root
+        input_folder_path = os.path.join(project_root, "src/modules/rrg/exports/input", input_folder_name)
+        output_folder_path = os.path.join(project_root, "src/modules/rrg/exports/output", input_folder_name)
+        
+        print(f"[DEBUG] Project root: {project_root}")
+        print(f"[DEBUG] Input folder path: {input_folder_path}")
+        print(f"[DEBUG] Output folder path: {output_folder_path}")
+        
+        # Create base directories first
+        base_input_dir = os.path.join(project_root, "src/modules/rrg/exports/input")
+        base_output_dir = os.path.join(project_root, "src/modules/rrg/exports/output")
+        
+        # Create base directories with proper permissions
+        os.makedirs(base_input_dir, exist_ok=True, mode=0o755)
+        os.makedirs(base_output_dir, exist_ok=True, mode=0o755)
+        
+        # Verify base directories exist
+        if not os.path.exists(base_input_dir) or not os.path.exists(base_output_dir):
+            raise RuntimeError(f"Failed to create base directories: {base_input_dir}, {base_output_dir}")
+        
+        # Create run-specific directories
+        os.makedirs(input_folder_path, exist_ok=True, mode=0o755)
+        os.makedirs(output_folder_path, exist_ok=True, mode=0o755)
+        
+        # Verify run-specific directories exist
+        if not os.path.exists(input_folder_path) or not os.path.exists(output_folder_path):
+            raise RuntimeError(f"Failed to create run directories: {input_folder_path}, {output_folder_path}")
         
         # Get market metadata
-        logger.debug(f"Getting market metadata for {len(tickers)} symbols")
-        start_time = time.time()
         market_metadata = get_market_metadata(tickers)
-        logger.info(f"Market metadata retrieval completed in {time.time() - start_time:.2f}s ({len(market_metadata)} rows)")
-        
+        if market_metadata.is_empty():
+            raise ValueError("No market metadata found")
+            
         # Get price data
         price_data = get_stock_prices(tickers, date_range, timeframe)
-        if price_data is None:
-            raise Exception("Failed to get price data")
+        if price_data.is_empty():
+            raise ValueError("No price data found")
             
-        # Join with market metadata
-        df = price_data.join(
-            market_metadata,
-            on="symbol",
-            how="left"
+        # Join data
+        df = price_data.join(market_metadata, on="symbol", how="left")
+        if df.is_empty():
+            raise ValueError("No data after joining price and metadata")
+            
+        # Ensure benchmark symbol exists and is first
+        benchmark_data = df.filter(pl.col("symbol") == index_symbol)
+        if len(benchmark_data) == 0:
+            raise ValueError(f"Benchmark symbol {index_symbol} not found in data")
+            
+        # Sort symbols to ensure benchmark is first
+        all_symbols = df["symbol"].unique().sort()
+        benchmark_first = pl.Series([index_symbol] + [s for s in all_symbols if s != index_symbol])
+        
+        # Reorder the data to ensure benchmark is first
+        df = df.sort(["symbol", "created_at"])
+        df = df.with_columns(
+            pl.col("symbol").cast(pl.Categorical).cat.set_ordering("lexical")
         )
         
-        # Get benchmark name - take the first occurrence if multiple exist
-        benchmark_rows = df.filter(pl.col("symbol") == index_symbol)
-        if len(benchmark_rows) == 0:
-            raise ValueError(f"Benchmark symbol {index_symbol} not found in data")
-        benchmark_name = benchmark_rows["name"].unique()[0]
+        # Generate CSV
+        csv_path = csv_generator(df, index_symbol, input_folder_name, input_folder_path)
+        if not csv_path or not os.path.exists(csv_path):
+            raise ValueError(f"Failed to generate CSV file at {csv_path}")
+            
+        print(f"[DEBUG] CSV file generated at: {csv_path}")
+        print(f"[DEBUG] CSV file exists: {os.path.exists(csv_path)}")
+        print(f"[DEBUG] CSV file size: {os.path.getsize(csv_path)} bytes")
         
-        # Get available symbols
-        available_symbols = df["symbol"].unique().to_list()
+        # Verify the input file exists and has content
+        input_file = os.path.join(input_folder_path, f"{input_folder_name}.csv")
+        if not os.path.exists(input_file):
+            raise ValueError(f"Input file not found at {input_file}")
+            
+        if os.path.getsize(input_file) == 0:
+            raise ValueError(f"Input file is empty at {input_file}")
+            
+        # Verify CSV content
+        with open(input_file, 'r') as f:
+            content = f.read()
+            if not content.strip():
+                raise ValueError("CSV file is empty")
+            
+            # Split into lines and verify each line
+            lines = content.strip().split('\n')
+            if not lines:
+                raise ValueError("CSV file has no content")
+                
+            # Get expected number of columns from header
+            header = lines[0]
+            expected_columns = len(header.split(','))
+            print(f"[DEBUG] Expected columns: {expected_columns}")
+            
+            # Verify each line has the correct number of columns
+            for i, line in enumerate(lines[1:], 1):
+                columns = line.split(',')
+                if len(columns) != expected_columns:
+                    print(f"[DEBUG] Line {i} has {len(columns)} columns, expected {expected_columns}")
+                    print(f"[DEBUG] Line content: {line}")
+                    raise ValueError(f"CSV file has inconsistent number of columns at line {i}")
+            
+            # Verify no line ends with a comma
+            for i, line in enumerate(lines[1:], 1):
+                if line.endswith(','):
+                    print(f"[DEBUG] Line {i} ends with a comma: {line}")
+                    raise ValueError(f"CSV file has trailing comma at line {i}")
+            
+        # Set proper permissions on the input file
+        os.chmod(input_file, 0o644)
         
-        # Create header row
-        header_df = pl.DataFrame({
-            "symbol": ["symbol"],
-            "name": ["name"],
-            "url": ["url"],
-            "data": [benchmark_name]
-        })
+        # Process with RRG binary
+        args = {
+            "input_folder_name": input_folder_name,
+            "input_folder_path": input_folder_path,
+            "output_folder_path": output_folder_path,
+            "channel_name": channel_name,
+            "do_publish": True
+        }
         
-        # Create metadata rows - only for symbols that have data
-        metadata_rows = []
-        for symbol in available_symbols:
-            symbol_data = df.filter(pl.col("symbol") == symbol).head(1)
-            if len(symbol_data) > 0:
-                metadata_rows.append({
-                    "symbol": symbol,
-                    "name": symbol_data["name"][0],
-                    "url": f"https://www.indiacharts.com/stock/{symbol_data['slug'][0] if 'slug' in symbol_data.columns else symbol.lower().replace(' ', '-')}",
-                    "data": ""
-                })
-        
-        metadata_df = pl.DataFrame(metadata_rows)
-        
-        # Pivot market data
-        market_data = df.pivot(
-            values="close_price",
-            index="created_at",
-            columns="symbol"
-        ).sort("created_at")
-        
-        # Ensure all DataFrames have the same columns
-        all_columns = ["symbol", "name", "url", "data"]
-        
-        # Select only the required columns for header and metadata
-        header_df = header_df.select(all_columns)
-        metadata_df = metadata_df.select(all_columns)
-        
-        # Convert market data to the same format
-        market_rows = []
-        for row in market_data.iter_rows(named=True):
-            market_row = {
-                "symbol": "created_at",
-                "name": "name",
-                "url": "url",
-                "data": str(row["created_at"])
-            }
-            for symbol in available_symbols:
-                if symbol in row:
-                    market_row[symbol] = str(row[symbol])
-            market_rows.append(market_row)
-        
-        market_df = pl.DataFrame(market_rows)
-        market_df = market_df.select(all_columns)
-        
-        # Combine all parts
-        final_df = pl.concat([
-            header_df,
-            metadata_df,
-            market_df
-        ])
-        
-        # Create a shorter filename using timestamp and hash
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename_hash = hash(str(available_symbols)) % 10000  # Use last 4 digits of hash
-        short_filename = f"rrg_{timestamp}_{filename_hash}.csv"
-        
-        # Write to CSV
-        input_folder_path = os.path.join(os.getcwd(), "data", "rrg", "input")
-        os.makedirs(input_folder_path, exist_ok=True)
-        input_file_path = os.path.join(input_folder_path, short_filename)
-        
-        final_df.write_csv(input_file_path, separator="\t")
-        logger.info(f"Created CSV file at {input_file_path}")
-        
-        return True
+        result = rrg_bin(args)
+        if not result or "error" in result:
+            raise ValueError(f"RRG binary processing failed: {result.get('error', 'Unknown error')}")
+            
+        # Keep the input files for inspection
+        print(f"[DEBUG] Input files preserved in: {input_folder_path}")
+        print(f"[DEBUG] Input file contents: {os.listdir(input_folder_path)}")
+            
+        return result
         
     except Exception as e:
-        logger.error(f"Failed to generate CSV: {str(e)}", exc_info=True)
-        return False
+        print(f"Error in generate_csv: {str(e)}")
+        return {"error": str(e)}
 
 
 def return_filter_days(timeframe):
