@@ -70,171 +70,60 @@ class RRGService:
             with TimerMetric("get_rrg_data", "rrg_service"):
                 start_time = time.time()
                 logger.info(f"Processing request for index: {request.index_symbol}, timeframe: {request.timeframe}")
-                tickers_list = [x.replace(" ", "-") for x in request.tickers]
-                tickers_list_key = "_".join(tickers_list)
-                filename = f"{request.index_symbol.replace(' ','-')}_{tickers_list_key}_{request.timeframe.replace(' ','-')}_{request.date_range.replace(' ','-')}_{request.last_traded_time}"
-
+                
+                # Create a shorter filename using hash
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                tickers_hash = hash("_".join(request.tickers)) % 10000  # Use last 4 digits of hash
+                filename = f"rrg_{timestamp}_{tickers_hash}"
+                
                 if request.is_custom_index:
-                    filename = f"{filename}_custom_index"
+                    filename = f"{filename}_custom"
                     logger.debug(f"Using custom index, filename: {filename}")
 
-                cache_hit = False
-                logger.debug(f"Checking cache for {filename}_rrg")
-                data = self.cache_manager.getCache(f"{filename}_rrg")
-                change_data = self.cache_manager.getCache(f"{filename}_change_historical")
+                # Always skip cache
+                request.skip_cache = True
+                logger.debug("Cache disabled - generating fresh data")
 
-                if request.skip_cache or data is None or change_data is None or (not change_data):
-                    logger.debug(f"Cache miss or skip_cache={request.skip_cache}, generating new data")
-                    if not request.skip_cache:
-                        if data is None:
-                            record_rrg_cache_miss("rrg")
-                        if change_data is None:
-                            record_rrg_cache_miss("change_historical")
-                    
-                    with TimerMetric("generate_csv", "rrg_service"):
-                        try:
-                            resp = generate_csv(
-                                request.tickers,
-                                request.date_range,
-                                request.index_symbol,
-                                request.timeframe,
-                                request.channel_name,
-                                filename,
-                                self.cache_manager
-                            )
-                        except Exception as e:
-                            record_rrg_error("csv_generation")
-                            logger.error(f"Failed to generate CSV data: {str(e)}", exc_info=True)
-                            raise Exception("Failed to generate data")
-
-                    if not resp:
-                        record_rrg_error("csv_generation_failed")
-                        logger.error("Failed to generate CSV data")
-                        raise Exception("Failed to generate data")
-                else:
-                    logger.debug(f"Cache hit for {filename}_rrg")
-                    record_rrg_cache_hit("rrg")
-                    if change_data:
-                        record_rrg_cache_hit("change_historical")
-                    resp = True
-                    cache_hit = True
-
-                if resp:
-                    with TimerMetric("process_response", "rrg_service"):
-                        logger.debug(f"Loading data from cache for {filename}_rrg")
-                        cached_data = self.cache_manager.getCache(f"{filename}_rrg")
-                        if cached_data is None:
-                            record_rrg_error("cache_retrieval")
-                            logger.error(f"Data not found in cache after generation: {filename}_rrg")
-                            logger.warning("Attempting to proceed without cache")
-                            logger.info(f"Request processed in {time.time() - start_time:.2f}s, returning empty data")
-                            return RrgResponse(
-                                data={"datalists": []}, # Return empty data
-                                change_data=None,
-                                filename=filename,
-                                cacheHit=False,
-                                error="Cache unavailable but CSV was generated"
-                            )
-
-                        data = json.loads(cached_data)
-                        record_rrg_data_points(len(data.get("datalists", [])), "datalists")
-
-                        if request.is_custom_index:
-                            logger.debug("Setting shorter expiry for custom index cache")
-                            self.cache_manager.setExpiry(f"{filename}_rrg", expiry_in_minutes=10)
-
-                        change_data = self.cache_manager.getCache(f"{filename}_change_historical")
-                        if change_data:
-                            logger.debug("Processing change data")
-                            change_data_json = json.loads(change_data)
-                            record_rrg_data_points(len(change_data_json), "change_data")
-
-                            try:
-                                with TimerMetric("merge_momentum", "rrg_service"):
-                                    logger.debug(f"Merging momentum data for timeframe: {request.timeframe}")
-                                    momentum_result = self._merge_momentum(data, change_data_json, request.timeframe)
-                                    change_data_final = json.loads(momentum_result)
-                                    data_points = len(change_data_final) if isinstance(change_data_final, list) else 0
-                                    record_rrg_data_points(data_points, "momentum_merged")
-                                    logger.debug(f"Momentum merge completed with {data_points} records")
-                            except Exception as e:
-                                record_rrg_error("momentum_merge")
-                                logger.error(f"Error processing momentum data: {str(e)}", exc_info=True)
-                                change_data_final = {"data": []}
-
-                            try:
-                                with TimerMetric("process_metadata", "rrg_service"):
-                                    logger.debug(f"Processing metadata for {len(data['datalists'])} datalist entries")
-                                    
-                                    data_pl = pl.DataFrame(data['datalists'])
-                                    symbols = data_pl.select("code").to_series().to_list()
-                                    logger.debug(f"Getting market metadata for {len(symbols)} symbols")
-                                    
-                                    metadata_pl = get_market_metadata(symbols)
-                                    if "security_type_code" in metadata_pl.columns:
-                                        metadata_pl = metadata_pl.with_columns(
-                                            pl.col("security_type_code").cast(pl.Float64)
-                                        )
-                                    data_pl = data_pl.join(
-                                        metadata_pl, 
-                                        left_on="code", 
-                                        right_on="symbol", 
-                                        how="left", 
-                                        suffix="_right"
-                                    )
-                                    
-                                    # Ensure consistent field names
-                                    data_pl = data_pl.with_columns([
-                                        pl.col("name_right").alias("name"),
-                                        pl.col("code").alias("symbol"),
-                                        pl.col("code").alias("meaningful_name"),
-                                        pl.col("code").alias("ticker"),
-                                        pl.col("code").str.to_lowercase().str.replace(" ", "-").alias("slug")
-                                    ])
-                                    
-                                    # Select only the required fields
-                                    columns = ['code', 'name', 'meaningful_name', 'slug', 'ticker', 'symbol', 'data']
-                                    data_pl = data_pl.select(columns)
-                                    data_pl = data_pl.unique(subset=["code"])
-                                    data['datalists'] = data_pl.select(columns).to_dicts()
-                                    
-                                    record_rrg_data_points(len(data['datalists']), "processed_metadata")
-                                    logger.debug(f"Processed {len(data['datalists'])} datalist entries with metadata")
-                                    
-                            except Exception as e:
-                                record_rrg_error("metadata_processing")
-                                logger.error(f"Error processing metadata: {str(e)}", exc_info=True)
-
-                            logger.info(f"Request processed in {time.time() - start_time:.2f}s with change data, cache_hit={cache_hit}")
-
-                            try:
-                                response = RrgResponse(
-                                    data=clean_for_json(data),
-                                    change_data=clean_for_json(change_data_final),
-                                    filename=filename,
-                                    cacheHit=cache_hit
-                                )
-                                return response
-                            except Exception as e:
-                                record_rrg_error("response_creation")
-                                logger.error(f"Error creating RrgResponse with change data: {str(e)}", exc_info=True)
-                                return RrgResponse(
-                                    data=clean_for_json(data),
-                                    change_data={},
-                                    filename=filename,
-                                    cacheHit=cache_hit
-                                )
-                        
-                        logger.info(f"Request processed in {time.time() - start_time:.2f}s without change data, cache_hit={cache_hit}")
-                        return RrgResponse(
-                            data=clean_for_json(data),
-                            change_data=None,
-                            filename=filename,
-                            cacheHit=cache_hit
+                with TimerMetric("generate_csv", "rrg_service"):
+                    try:
+                        resp = generate_csv(
+                            request.tickers,
+                            request.date_range,
+                            request.index_symbol,
+                            request.timeframe,
+                            request.channel_name,
+                            filename,
+                            self.cache_manager
                         )
-                record_rrg_error("data_retrieval")
-                logger.error("Failed to generate or retrieve data")
-                raise Exception("Internal Server Error")
+                    except Exception as e:
+                        record_rrg_error("csv_generation")
+                        logger.error(f"Failed to generate CSV data: {str(e)}", exc_info=True)
+                        raise Exception("Failed to generate data")
+
+                if not resp:
+                    record_rrg_error("csv_generation_failed")
+                    logger.error("Failed to generate CSV data")
+                    raise Exception("Failed to generate data")
+
+                with TimerMetric("process_response", "rrg_service"):
+                    # Return the data directly from the response
+                    if isinstance(resp, dict) and "data" in resp:
+                        logger.info(f"Request processed in {time.time() - start_time:.2f}s, returning data from response")
+                        return RrgResponse(
+                            data=resp["data"],
+                            change_data=None,
+                            filename=resp.get("filename", filename),
+                            cacheHit=False
+                        )
+                    
+                    logger.info(f"Request processed in {time.time() - start_time:.2f}s, returning empty data")
+                    return RrgResponse(
+                        data={"datalists": []},
+                        change_data=None,
+                        filename=filename,
+                        cacheHit=False,
+                        error="Failed to generate data"
+                    )
 
     def _check_apply_pl(self, data_values, meaningful_name):
         """Process daily data using polars operations."""
