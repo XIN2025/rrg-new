@@ -10,6 +10,7 @@ from datetime import datetime, timezone, timedelta
 from src.utils.metrics import TimerMetric, DuckDBQueryTimer
 from src.utils.logger import get_logger
 from src.utils.duck_pool import get_duckdb_connection
+from src.modules.rrg.time_utils import return_filter_days
 
 INDIAN_TZ = "Asia/Kolkata"
 
@@ -401,21 +402,7 @@ def get_stock_prices(tickers, symbols, filter_days=30):
 
         # Convert timeframe to days if it's a string
         if isinstance(filter_days, str):
-            if filter_days.endswith('m'):
-                # Convert minutes to days (assuming 6.5 trading hours per day)
-                # 6.5 hours * 60 minutes = 390 minutes per trading day
-                minutes = int(filter_days[:-1])
-                filter_days = (minutes * 5) // 390 + 5  # Add 5 days buffer
-            elif filter_days.endswith('h'):
-                # Convert hours to days
-                hours = int(filter_days[:-1])
-                filter_days = (hours * 5) // 6.5 + 5  # Add 5 days buffer
-            elif filter_days.endswith('d'):
-                # Already in days
-                filter_days = int(filter_days[:-1])
-            else:
-                # Assume it's already in days
-                filter_days = int(filter_days)
+            filter_days = return_filter_days(filter_days)
 
         # Calculate cutoff date in UTC
         cutoff_date = datetime.now(timezone.utc) - timedelta(days=filter_days)

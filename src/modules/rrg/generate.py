@@ -23,6 +23,7 @@ from src.modules.rrg.metadata_store import (
     get_metadata_status, get_stock_prices, get_eod_stock_data,
     get_price_data_status
 )
+from src.modules.rrg.time_utils import return_filter_days, split_time
 
 # Get logger for this module
 logger = get_logger("rrg_generate")
@@ -207,6 +208,11 @@ def return_filter_days(timeframe):
             days = 252 + 60  # 252 trading days + buffer
         elif timeframe == "monthly":
             days = 252 + 90  # 252 trading days + buffer
+        elif timeframe.endswith('h'):  # Handle hour-based timeframes
+            hours = int(timeframe[:-1])
+            days = (hours * 5) // 6.5 + 5  # Add 5 days buffer
+        elif timeframe.endswith('d'):  # Handle day-based timeframes
+            days = int(timeframe[:-1]) + 30  # Add 30 days buffer
         elif "week" in timeframe:
             days = split_time(7, timeframe) + 60
         elif "month" in timeframe:
@@ -214,8 +220,12 @@ def return_filter_days(timeframe):
         elif "year" in timeframe:
             days = split_time(365, timeframe) + 200
         else:
-            # Handle numeric timeframes like "5 days"
-            days = int(timeframe.split(" ")[0]) + 30
+            # Assume it's already in days
+            try:
+                days = int(timeframe.split(" ")[0]) + 30
+            except (ValueError, IndexError):
+                logger.warning(f"Invalid timeframe format: {timeframe}, defaulting to 30 days")
+                days = 30
             
         logger.debug(f"Calculated {days} filter days for {timeframe}")
         return days
