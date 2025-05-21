@@ -1,3 +1,89 @@
+import polars as pl
+from datetime import datetime, timezone
+from src.utils.metrics import TimerMetric, DuckDBQueryTimer
+from src.utils.logger import get_logger
+from src.utils.duck_pool import get_duckdb_connection
+import time as t
+import logging
+
+# Configure logger to only show errors
+logger = get_logger("rrg_reference_data")
+logger.setLevel(logging.ERROR)
+
+class RRGReferenceDataLoader:
+    def __init__(self):
+        self._market_metadata_df = None
+        self._metadata_loaded = False
+        self._last_refresh_time = None
+        self.ensure_metadata_loaded()
+
+    def _load_metadata(self):
+        """
+        Internal function to load market metadata from DuckDB.
+        """
+        conn = get_duckdb_connection()
+        
+        try:
+            with DuckDBQueryTimer("market_metadata_query"):
+                self._market_metadata_df = conn.sql(
+                    """SELECT 
+                        symbol, 
+                        name, 
+                        slug, 
+                        ticker, 
+                        security_code, 
+                        security_type_code 
+                    FROM public.market_metadata 
+                    WHERE security_type_code IN (5, 26)"""
+                ).pl()
+            
+            return True
+        except Exception as e:
+            logger.error(f"[RRG Reference Data] Error loading metadata: {str(e)}", exc_info=True)
+            return False
+
+    def ensure_metadata_loaded(self):
+        """
+        Ensures that metadata is loaded if it hasn't been already.
+        """
+        with TimerMetric("ensure_metadata_loaded", "rrg_reference_data"):
+            if self._metadata_loaded:
+                return True
+            
+            success = self._load_metadata()
+            
+            if success:
+                self._metadata_loaded = True
+                self._last_refresh_time = datetime.now(timezone.utc)
+                return True
+            else:
+                logger.error("[RRG Reference Data] Failed to load metadata")
+                return False
+
+    def refresh_metadata(self):
+        """
+        Forces a refresh of market metadata.
+        """
+        with TimerMetric("refresh_metadata", "rrg_reference_data"):
+            success = self._load_metadata()
+            
+            if success:
+                self._metadata_loaded = True
+                self._last_refresh_time = datetime.now(timezone.utc)
+                return True
+            else:
+                logger.error("[RRG Reference Data] Failed to refresh metadata")
+                return False
+
+    def get_metadata_status(self):
+        """
+        Returns the current status of metadata loading.
+        """
+        return {
+            "loaded": self._metadata_loaded,
+            "last_refresh": self._last_refresh_time.isoformat() if self._last_refresh_time else None
+        }
+
 def load_market_metadata(dd_con=None, force=False):
     """Load market metadata from ClickHouse into DuckDB."""
     try:

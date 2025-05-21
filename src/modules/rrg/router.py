@@ -9,9 +9,11 @@ from src.utils.metrics import (
 from src.utils.logger import get_logger
 from src.modules.rrg.metadata_store import get_metadata_status, refresh_metadata
 import time
+import logging
 
-# Get logger for this module
+# Configure logger to only show errors
 logger = get_logger("rrg_router")
+logger.setLevel(logging.ERROR)
 
 router = APIRouter(prefix="/rrg", tags=["RRG"])
 service = RRGService()

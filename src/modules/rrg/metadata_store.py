@@ -12,10 +12,13 @@ from src.utils.logger import get_logger
 from src.utils.duck_pool import get_duckdb_connection
 from src.modules.rrg.time_utils import return_filter_days
 import time as t
+import logging
 
 INDIAN_TZ = "Asia/Kolkata"
 
+# Configure logger to only show errors
 logger = get_logger("rrg_metadata")
+logger.setLevel(logging.ERROR)
 
 # Create a singleton instance
 _metadata_store = None
@@ -70,28 +73,22 @@ class RRGMetadataStore:
         This is called by ensure_metadata_loaded and refresh_metadata.
         """
         conn = get_duckdb_connection()
-        logger.debug("[RRG Metadata] Connected to DuckDB")
         
         try:
             with DuckDBQueryTimer("indices_query"):
                 self._indices_df = conn.sql("SELECT security_code, name, slug, symbol FROM public.indices").pl()
-            logger.info(f"[RRG Metadata] Loaded {len(self._indices_df)} indices")
             
             with DuckDBQueryTimer("indices_stocks_query"):
                 self._indices_stocks_df = conn.sql("SELECT security_code FROM public.indices_stocks").pl()
-            logger.info(f"[RRG Metadata] Loaded {len(self._indices_stocks_df)} indices_stocks entries")
             
             with DuckDBQueryTimer("companies_query"):
                 self._companies_df = conn.sql("SELECT slug, name FROM public.companies").pl()
-            logger.info(f"[RRG Metadata] Loaded {len(self._companies_df)} companies")
             
             with DuckDBQueryTimer("stocks_query"):
                 self._stocks_df = conn.sql("SELECT company_name, security_code FROM public.stocks").pl()
-            logger.info(f"[RRG Metadata] Loaded {len(self._stocks_df)} stocks")
             
             with DuckDBQueryTimer("market_metadata_query"):
                 self._market_metadata_df = conn.sql("SELECT symbol, name, slug, ticker, security_code, security_type_code FROM public.market_metadata").pl()
-            logger.info(f"[RRG Metadata] Loaded {len(self._market_metadata_df)} market metadata entries")
             
             return True
         except Exception as e:
@@ -109,11 +106,9 @@ class RRGMetadataStore:
             self._price_data_days = days
         
         conn = get_duckdb_connection()
-        logger.debug("[RRG Price Data] Connected to DuckDB")
         
         try:
             load_start = t.time()
-            logger.info(f"[RRG Price Data] Loading price data for last {self._price_data_days} days...")
             
             # First get the list of index symbols from market_metadata
             index_symbols = conn.sql(
@@ -124,8 +119,6 @@ class RRGMetadataStore:
             
             if not index_symbols:
                 raise ValueError("No index symbols found in market_metadata")
-            
-            logger.info(f"[RRG Price Data] Found {len(index_symbols)} index symbols")
             
             # Load index data first
             with DuckDBQueryTimer("index_prices_query"):
@@ -143,7 +136,6 @@ class RRGMetadataStore:
                     AND current_price > 0  -- Ensure positive prices
                     ORDER BY created_at ASC"""
                 ).pl()
-            logger.info(f"[RRG Price Data] Loaded {len(self._stock_prices_df)} index price entries")
             
             # Load EOD data for indices
             with DuckDBQueryTimer("eod_index_data_query"):
@@ -161,7 +153,6 @@ class RRGMetadataStore:
                     AND close_price > 0  -- Ensure positive prices
                     ORDER BY created_at ASC"""
                 ).pl()
-            logger.info(f"[RRG Price Data] Loaded {len(self._eod_stock_data_df)} EOD index data entries")
             
             # Join with market_metadata to get additional fields
             self._stock_prices_df = self._stock_prices_df.join(
@@ -181,7 +172,7 @@ class RRGMetadataStore:
                 pl.col("created_at").dt.replace_time_zone("UTC").dt.convert_time_zone("Asia/Kolkata").alias("created_at")
             )
             self._eod_stock_data_df = self._eod_stock_data_df.with_columns(
-                pl.col("created_at").dt.replace_time_zone("UTC").dt.convert_time_zone("Asia/Kolkata").alias("created_at")
+                pl.col("created_at").dt.replace_time_zone("UTC").dt.convert_time_zone(INDIAN_TZ).alias("created_at")
             )
             
             # Remove timezone info from stock prices
@@ -210,8 +201,6 @@ class RRGMetadataStore:
                     ])
             
             # Validate data
-            logger.info(f"[RRG Price Data] Validating data...")
-            
             # Check for required columns
             required_columns = ["created_at", "symbol", "close_price", "security_code", "ticker", "name", "slug", "security_type_code"]
             for df_name, df in [("stock_prices", self._stock_prices_df), ("eod_stock_data", self._eod_stock_data_df)]:
@@ -231,12 +220,6 @@ class RRGMetadataStore:
                 if len(invalid_prices) > 0:
                     raise ValueError(f"Found non-positive prices in {df_name}")
             
-            logger.info(f"[RRG Price Data] Data validation completed")
-            logger.info(f"[RRG Price Data] EOD stock data max date: {self._eod_stock_data_df['created_at'].max()}")
-            
-            load_duration = (t.time() - load_start)
-            logger.info(f"[RRG Price Data] Price data loading completed in {load_duration:.2f} seconds")
-            
             return True
         except Exception as e:
             logger.error(f"[RRG Price Data] Error loading price data: {str(e)}", exc_info=True)
@@ -248,16 +231,13 @@ class RRGMetadataStore:
         """
         with TimerMetric("ensure_metadata_loaded", "rrg_metadata"):
             if self._metadata_loaded:
-                logger.debug("[RRG Metadata] Metadata already loaded, using existing data")
                 return True
             
-            logger.info("[RRG Metadata] Loading metadata tables...")
             success = self._load_metadata()
             
             if success:
                 self._metadata_loaded = True
                 self._last_refresh_time = datetime.now(timezone.utc)
-                logger.info(f"[RRG Metadata] Initial metadata load completed at {self._last_refresh_time}")
                 return True
             else:
                 logger.error("[RRG Metadata] Failed to load metadata")
@@ -272,16 +252,13 @@ class RRGMetadataStore:
         """
         with TimerMetric("ensure_price_data_loaded", "rrg_metadata"):
             if self._price_data_loaded:
-                logger.debug("[RRG Price Data] Price data already loaded, using existing data")
                 return True
             
-            logger.info("[RRG Price Data] Loading price data...")
             success = self._load_price_data(days)
             
             if success:
                 self._price_data_loaded = True
                 self._last_price_refresh_time = datetime.now(timezone.utc)
-                logger.info(f"[RRG Price Data] Initial price data load completed at {self._last_price_refresh_time}")
                 return True
             else:
                 logger.error("[RRG Price Data] Failed to load price data")
@@ -292,13 +269,11 @@ class RRGMetadataStore:
         Forces a refresh of all metadata tables.
         """
         with TimerMetric("refresh_metadata", "rrg_metadata"):
-            logger.info("[RRG Metadata] Refreshing metadata tables...")
             success = self._load_metadata()
             
             if success:
                 self._metadata_loaded = True
                 self._last_refresh_time = datetime.now(timezone.utc)
-                logger.info(f"[RRG Metadata] Metadata refresh completed at {self._last_refresh_time}")
                 return True
             else:
                 logger.error("[RRG Metadata] Failed to refresh metadata")
@@ -312,13 +287,11 @@ class RRGMetadataStore:
             days: Optional number of days of historical data to load
         """
         with TimerMetric("refresh_price_data", "rrg_metadata"):
-            logger.info("[RRG Price Data] Refreshing price data...")
             success = self._load_price_data(days)
             
             if success:
                 self._price_data_loaded = True
                 self._last_price_refresh_time = datetime.now(timezone.utc)
-                logger.info(f"[RRG Price Data] Price data refresh completed at {self._last_price_refresh_time}")
                 return True
             else:
                 logger.error("[RRG Price Data] Failed to refresh price data")
@@ -372,15 +345,22 @@ class RRGMetadataStore:
 
     def get_market_metadata(self, symbols=None):
         """
-        Returns a copy of the market metadata DataFrame, optionally filtered by symbols.
-        
-        Args:
-            symbols: Optional list of symbols to filter by
+        Get market metadata for specified symbols.
+        If symbols is None, returns all metadata.
         """
-        self.ensure_metadata_loaded()
-        if symbols is None:
-            return self._market_metadata_df.clone()
-        return self._market_metadata_df.filter(pl.col("symbol").is_in(symbols)).clone()
+        try:
+            if symbols is None:
+                return self._market_metadata_df.clone()
+            
+            # Convert symbols to list if it's a single string
+            if isinstance(symbols, str):
+                symbols = [symbols]
+            
+            # Filter metadata for specified symbols
+            return self._market_metadata_df.filter(pl.col("symbol").is_in(symbols)).clone()
+        except Exception as e:
+            logger.error(f"Error getting market metadata: {str(e)}", exc_info=True)
+            raise
 
     def get_stock_prices(self, symbols, timeframe="daily", filter_days=None):
         """Get stock prices from DuckDB."""

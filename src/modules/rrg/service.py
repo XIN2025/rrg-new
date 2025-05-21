@@ -13,10 +13,14 @@ from src.utils.metrics import (
 )
 from src.utils.logger import get_logger
 from src.modules.db.data_manager import load_data, load_hourly_data
-from datetime import datetime
+from datetime import datetime, timezone
 import numpy as np
+import logging
+from src.utils.duck_pool import get_duckdb_connection
 
+# Configure logger to only show errors
 logger = get_logger("rrg_service")
+logger.setLevel(logging.ERROR)
 
 def clean_for_json(obj):
     """Clean objects to ensure they're JSON serializable"""
@@ -66,64 +70,54 @@ class RRGService:
                 raise
     
     async def get_rrg_data(self, request: RrgRequest) -> RrgResponse:
-        with RRGRequestMetrics(request.timeframe, request.index_symbol, request.date_range):
-            with TimerMetric("get_rrg_data", "rrg_service"):
-                start_time = time.time()
-                logger.info(f"Processing request for index: {request.index_symbol}, timeframe: {request.timeframe}")
+        """
+        Get RRG data for the specified request.
+        """
+        with TimerMetric("get_rrg_data", "rrg_service"):
+            try:
+                # Validate request
+                if not request.index_symbol or not request.timeframe:
+                    raise ValueError("Index symbol and timeframe are required")
                 
-                # Create a shorter filename using hash
+                # Get tickers from request
+                tickers = request.tickers or []
+                if request.index_symbol not in tickers:
+                    tickers.append(request.index_symbol)
+                
+                # Generate a filename using timestamp and hash
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                tickers_hash = hash("_".join(request.tickers)) % 10000  # Use last 4 digits of hash
+                tickers_hash = hash("_".join(tickers)) % 10000  # Use last 4 digits of hash
                 filename = f"rrg_{timestamp}_{tickers_hash}"
                 
-                if request.is_custom_index:
-                    filename = f"{filename}_custom"
-                    logger.debug(f"Using custom index, filename: {filename}")
-
-                # Always skip cache
-                request.skip_cache = True
-                logger.debug("Cache disabled - generating fresh data")
-
-                with TimerMetric("generate_csv", "rrg_service"):
-                    try:
-                        resp = generate_csv(
-                            request.tickers,
-                            request.date_range,
-                            request.index_symbol,
-                            request.timeframe,
-                            request.channel_name,
-                            filename,
-                            self.cache_manager
-                        )
-                    except Exception as e:
-                        record_rrg_error("csv_generation")
-                        logger.error(f"Failed to generate CSV data: {str(e)}", exc_info=True)
-                        raise Exception("Failed to generate data")
-
+                # Convert date_range to integer
+                try:
+                    date_range = int(request.date_range)
+                except ValueError:
+                    raise ValueError(f"Invalid date_range value: {request.date_range}")
+                
+                # Generate CSV data
+                resp = generate_csv(
+                    tickers=tickers,
+                    date_range=date_range,
+                    index_symbol=request.index_symbol,
+                    timeframe=request.timeframe,
+                    channel_name=request.channel_name,
+                    filename=filename,
+                    cache_manager=self.cache_manager
+                )
+                
                 if not resp:
-                    record_rrg_error("csv_generation_failed")
-                    logger.error("Failed to generate CSV data")
                     raise Exception("Failed to generate data")
-
-                with TimerMetric("process_response", "rrg_service"):
-                    # Return the data directly from the response
-                    if isinstance(resp, dict) and "data" in resp:
-                        logger.info(f"Request processed in {time.time() - start_time:.2f}s, returning data from response")
-                        return RrgResponse(
-                            data=resp["data"],
-                            change_data=None,
-                            filename=resp.get("filename", filename),
-                            cacheHit=False
-                        )
-                    
-                    logger.info(f"Request processed in {time.time() - start_time:.2f}s, returning empty data")
-                    return RrgResponse(
-                        data={"datalists": []},
-                        change_data=None,
-                        filename=filename,
-                        cacheHit=False,
-                        error="Failed to generate data"
-                    )
+                
+                return RrgResponse(
+                    status="success",
+                    data=resp["data"],
+                    filename=filename
+                )
+                
+            except Exception as e:
+                logger.error(f"Failed to generate CSV data: {str(e)}", exc_info=True)
+                raise Exception("Failed to generate data")
 
     def _check_apply_pl(self, data_values, meaningful_name):
         """Process daily data using polars operations."""
@@ -331,3 +325,71 @@ class RRGService:
             record_rrg_error("json_format")
             logger.error(f"Error ensuring JSON format: {str(e)}", exc_info=True)
             return "[]"
+
+def load_eod_data(days=None):
+    """
+    Load EOD data from DuckDB.
+    
+    Args:
+        days: Number of days of historical data to load
+    """
+    with TimerMetric("load_eod_data", "rrg_service"):
+        conn = get_duckdb_connection()
+        
+        try:
+            if days is None:
+                days = 3650  # Default to 10 years
+            
+            with DuckDBQueryTimer("eod_data_query"):
+                df = conn.sql(
+                    f"""SELECT 
+                        created_at,
+                        symbol,
+                        close_price,
+                        security_code,
+                        previous_close,
+                        ticker
+                    FROM public.eod_stock_data 
+                    WHERE created_at >= CURRENT_DATE - INTERVAL '{days} days'
+                    AND close_price > 0
+                    ORDER BY created_at ASC"""
+                ).pl()
+            
+            return df
+        except Exception as e:
+            logger.error(f"[RRG Service] Error loading EOD data: {str(e)}", exc_info=True)
+            return None
+
+def load_hourly_data(days=None):
+    """
+    Load hourly data from DuckDB.
+    
+    Args:
+        days: Number of days of historical data to load
+    """
+    with TimerMetric("load_hourly_data", "rrg_service"):
+        conn = get_duckdb_connection()
+        
+        try:
+            if days is None:
+                days = 3650  # Default to 10 years
+            
+            with DuckDBQueryTimer("hourly_data_query"):
+                df = conn.sql(
+                    f"""SELECT 
+                        created_at,
+                        symbol,
+                        current_price as close_price,
+                        security_code,
+                        previous_close,
+                        ticker
+                    FROM public.stock_prices
+                    WHERE created_at >= CURRENT_DATE - INTERVAL '{days} days'
+                    AND current_price > 0
+                    ORDER BY created_at ASC"""
+                ).pl()
+            
+            return df
+        except Exception as e:
+            logger.error(f"[RRG Service] Error loading hourly data: {str(e)}", exc_info=True)
+            return None

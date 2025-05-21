@@ -10,7 +10,17 @@ import time
 from config import REDIS_CONFIG
 import logging
 
+# Configure logging to only show errors
+logging.basicConfig(
+    level=logging.ERROR,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
+
+# Disable all other loggers
+for name in logging.root.manager.loggerDict:
+    if name != __name__:
+        logging.getLogger(name).setLevel(logging.ERROR)
 
 def main(args):
     st = time.time()
@@ -131,10 +141,9 @@ def main(args):
             if output.returncode != 0:
                 return {"error": f"RRG processing failed: {output.stderr}"}
                 
-            # Log the output for debugging
-            logger.debug(f"RRG binary output: {output.stdout}")
+            # Only log errors from the binary output
             if output.stderr:
-                logger.warning(f"RRG binary warnings: {output.stderr}")
+                logger.error(f"RRG binary errors: {output.stderr}")
         finally:
             # Always change back to original directory
             os.chdir(original_dir)
@@ -170,7 +179,7 @@ def main(args):
                     pass
         
         # Try to read the output file
-        result = read_output_file(args, input_folder_path, output_folder_path, input_folder_name)
+        result = read_output_file(args, input_folder_path, output_folder_path, data_file)
         if not result:
             return {"error": "Failed to read output file"}
 
@@ -199,148 +208,132 @@ def download_file_from_s3(args, input_folder_path, file_name):
         f"{input_folder_path}/{file_name}.csv",
     )
 
-    print(f"[RRG_{file_name}] Input file downloaded")
-    print(f'[RRG_{file_name}] {os.listdir(input_folder_path)}')
-
     return
 
 def read_output_file(args, input_folder_path, output_folder_path, file_name):
-    os.makedirs(output_folder_path, exist_ok=True)
-    
-    if not os.path.exists(output_folder_path):
-        return False
-        
+    """Read and format the output file from RRG binary."""
     try:
-        files = os.listdir(output_folder_path)
-    except FileNotFoundError:
-        return False
+        # Read the JSON file with UTF-8-SIG encoding to handle BOM
+        json_file_path = os.path.join(output_folder_path, file_name)
+        with open(json_file_path, 'r', encoding='utf-8-sig') as f:
+            json_data = json.load(f)
 
-    if files:
-        # Find the -1_Day file
-        data_file = None
-        for file in files:
-            if file.endswith('.json') and '-1_Day.' in file:
-                data_file = file
-                break
-        
-        if not data_file:
-            return False
-            
-        output_file = os.path.join(output_folder_path, data_file)
-
+        # Read the original CSV to get metadata
+        csv_metadata = {}
         try:
-            with open(output_file, "r", encoding="utf-8-sig") as file:
-                content = file.read()
-                if not content.strip():
-                    return False
-                    
-                try:
-                    json_data = json.loads(content)
-                    if not json_data:
-                        return False
-                        
-                    # Get benchmark data from input CSV
-                    benchmark_data = []
-                    try:
-                        with open(os.path.join(input_folder_path, f"{file_name}.csv"), 'r') as f:
-                            for line in f:
-                                parts = line.strip().split(',')
-                                if len(parts) >= 3 and parts[1].upper() == "CNX500":
-                                    benchmark_data.append(float(parts[2]))
-                    except Exception as e:
-                        logger.warning(f"Error reading benchmark data from CSV: {str(e)}")
-                    
-                    # Format the datalists properly
-                    formatted_datalists = []
-                    for item in json_data.get("datalists", []):
-                        # Get the symbol from the data points
-                        symbol = None
-                        if item.get("data") and len(item["data"]) > 0:
-                            # Try to get symbol from the first data point
-                            first_point = item["data"][0]
-                            if len(first_point) >= 2:
-                                symbol = first_point[1]  # Symbol should be in the second position
-                        
-                        # Get metadata from the original data
-                        metadata = {}
-                        try:
-                            with open(os.path.join(input_folder_path, f"{file_name}.csv"), 'r') as f:
-                                for line in f:
-                                    parts = line.strip().split(',')
-                                    if len(parts) >= 3 and parts[1] == symbol:
-                                        metadata = {
-                                            "code": parts[1],
-                                            "name": parts[1],
-                                            "ticker": parts[1],
-                                            "slug": parts[1].lower().replace(" ", "-"),
-                                            "security_code": parts[1],
-                                            "security_type_code": 26.0
-                                        }
-                                        break
-                        except Exception as e:
-                            logger.warning(f"Error reading metadata from CSV: {str(e)}")
-                        
-                        formatted_item = {
-                            "code": metadata.get("code", symbol or item.get("code", "")),
-                            "name": metadata.get("name", symbol or item.get("name", "")),
-                            "meaningful_name": metadata.get("name", symbol or item.get("meaningful_name", "")),
-                            "slug": metadata.get("slug", item.get("slug", "").lower().replace(" ", "-")),
-                            "ticker": metadata.get("ticker", symbol or item.get("ticker", "")),
-                            "symbol": symbol or item.get("symbol", ""),
-                            "security_code": metadata.get("security_code", item.get("security_code", "")),
-                            "security_type_code": float(metadata.get("security_type_code", item.get("security_type_code", 26.0))),
-                            "data": []
+            with open(os.path.join(input_folder_path, f"{args['input_folder_name']}.csv"), 'r', encoding='utf-8-sig') as f:
+                for line in f:
+                    parts = line.strip().split(',')
+                    if len(parts) >= 9:
+                        symbol = parts[1]
+                        csv_metadata[symbol] = {
+                            "code": parts[1],
+                            "name": parts[6],
+                            "ticker": parts[5],
+                            "slug": parts[7],
+                            "security_code": parts[3],
+                            "security_type_code": float(parts[8])
                         }
-                        
-                        # Format data points with actual values
-                        for point in item.get("data", []):
-                            if len(point) >= 9:
-                                try:
-                                    # Convert all values to float and format to 2 decimal places
-                                    formatted_point = [
-                                        point[0],  # date
-                                        f"{float(point[1]):.2f}",  # value1
-                                        f"{float(point[2]):.2f}",  # value2
-                                        f"{float(point[3]):.2f}",  # value3
-                                        f"{float(point[4]):.2f}",  # value4
-                                        f"{float(point[5]):.2f}",  # value5
-                                        f"{float(point[6]):.2f}",  # value6
-                                        f"{float(point[7]):.2f}",  # value7
-                                        f"{float(point[8]):.2f}"   # value8
-                                    ]
-                                    formatted_item["data"].append(formatted_point)
-                                except (ValueError, TypeError) as e:
-                                    logger.warning(f"Error formatting data point: {str(e)}, skipping")
-                                    continue
-                        
-                        formatted_datalists.append(formatted_item)
-                    
-                    # Return the data directly in the expected format
-                    result = {
-                        "data": {
-                            "benchmark": "cnx500",  # Always use lowercase
-                            "indexdata": [f"{x:.2f}" for x in benchmark_data],  # Use actual benchmark data
-                            "datalists": formatted_datalists
-                        },
-                        "change_data": None,
-                        "filename": file_name,
-                        "cacheHit": False
-                    }
-                    
-                    # Verify we have the required data
-                    if not result["data"]["benchmark"] or not result["data"]["indexdata"]:
-                        return False
-                        
-                    return result
-                    
-                except json.JSONDecodeError:
-                    return False
-                    
-        except Exception:
-            return False
-            
-    return False
+        except Exception as e:
+            logger.error(f"Error reading metadata from CSV: {str(e)}")
 
+        # Format the response
+        formatted_response = {
+            "indexdata": [],
+            "datalists": []
+        }
+
+        # Process index data - ensure we get unique timestamps
+        seen_timestamps = set()
+        for point in json_data.get("indexdata", []):
+            if len(point) >= 9:
+                try:
+                    timestamp = point[0]
+                    if timestamp not in seen_timestamps:
+                        seen_timestamps.add(timestamp)
+                        formatted_point = [
+                            timestamp,  # date
+                            str(float(point[1])),  # ratio
+                            str(float(point[2])),  # momentum
+                            str(float(point[3])),  # additional metrics
+                            str(float(point[4])),
+                            str(float(point[5])),
+                            str(float(point[6])),
+                            str(float(point[7])),
+                            str(float(point[8]))
+                        ]
+                        formatted_response["indexdata"].append(formatted_point)
+                except (ValueError, TypeError) as e:
+                    logger.error(f"Error formatting index data point: {str(e)}")
+                    continue
+
+        # Sort index data by timestamp
+        formatted_response["indexdata"].sort(key=lambda x: x[0])
+
+        # Process datalists - ensure we get unique timestamps per symbol
+        for item in json_data.get("datalists", []):
+            # Get the actual symbol from the data points
+            actual_symbol = None
+            if item.get("data") and len(item["data"]) > 0:
+                first_point = item["data"][0]
+                if len(first_point) >= 2:
+                    # Try to find the actual symbol from the CSV metadata
+                    for symbol, metadata in csv_metadata.items():
+                        if symbol in first_point[1]:  # Check if symbol is part of the data point
+                            actual_symbol = symbol
+                            break
+
+            # Get metadata for this symbol
+            metadata = csv_metadata.get(actual_symbol, {}) if actual_symbol else {}
+
+            # Create formatted item with proper metadata
+            formatted_item = {
+                "code": metadata.get("code", item.get("code", "")),
+                "name": metadata.get("name", item.get("name", "")),
+                "meaningful_name": metadata.get("name", item.get("meaningful_name", "")),
+                "slug": metadata.get("slug", item.get("slug", "").lower().replace(" ", "-")),
+                "ticker": metadata.get("ticker", item.get("ticker", "")),
+                "symbol": actual_symbol or item.get("symbol", ""),
+                "security_code": metadata.get("security_code", item.get("security_code", "")),
+                "security_type_code": float(metadata.get("security_type_code", item.get("security_type_code", 26.0))),
+                "data": []
+            }
+
+            # Track seen timestamps for this symbol
+            symbol_seen_timestamps = set()
+
+            # Format data points - ensure unique timestamps
+            for point in item.get("data", []):
+                if len(point) >= 9:
+                    try:
+                        timestamp = point[0]
+                        if timestamp not in symbol_seen_timestamps:
+                            symbol_seen_timestamps.add(timestamp)
+                            formatted_point = [
+                                timestamp,  # date
+                                str(float(point[1])),  # ratio
+                                str(float(point[2])),  # momentum
+                                str(float(point[3])),  # additional metrics
+                                str(float(point[4])),
+                                str(float(point[5])),
+                                str(float(point[6])),
+                                str(float(point[7])),
+                                str(float(point[8]))
+                            ]
+                            formatted_item["data"].append(formatted_point)
+                    except (ValueError, TypeError) as e:
+                        logger.error(f"Error formatting data point: {str(e)}")
+                        continue
+
+            # Sort data points by timestamp
+            formatted_item["data"].sort(key=lambda x: x[0])
+            formatted_response["datalists"].append(formatted_item)
+
+        return formatted_response
+
+    except Exception as e:
+        logger.error(f"Error reading output file: {str(e)}")
+        raise
 
 def get_rrg_redis_client():
     r = redis.Redis(
@@ -351,7 +344,6 @@ def get_rrg_redis_client():
     )
     return r
 
-
 def get_redis_client():
     r = redis.Redis(
         host=REDIS_CONFIG["default"]["host"],
@@ -360,7 +352,6 @@ def get_redis_client():
         db=REDIS_CONFIG["default"]["db"]
     )
     return r
-
 
 def return_cleint():
     mqttc = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, transport="websockets")
@@ -371,7 +362,6 @@ def return_cleint():
         port=443,
     )
     return mqttc
-
 
 def publish_msg(mqttc, json_data, channel_name):
     r = get_redis_client()
