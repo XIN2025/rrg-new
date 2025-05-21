@@ -211,7 +211,7 @@ def generate_csv(tickers, date_range, index_symbol, timeframe, channel_name, fil
             
         # Format the response data
         formatted_datalists = []
-        for item in result.get("datalists", []):
+        for item in result.get("data", {}).get("datalists", []):
             formatted_item = {
                 "code": item.get("code", ""),
                 "name": item.get("name", ""),
@@ -250,27 +250,27 @@ def generate_csv(tickers, date_range, index_symbol, timeframe, channel_name, fil
         # Create response structure
         response = {
             "data": {
-                "datalists": formatted_datalists,
-                "benchmark": index_symbol.lower(),
-                "indexdata": [f"{float(x):.2f}" for x in result.get("indexdata", [])[:50]]  # Limit to 50 points
+                "benchmark": result.get("data", {}).get("benchmark", "").lower(),
+                "indexdata": [f"{float(x):.2f}" for x in result.get("data", {}).get("indexdata", [])],
+                "datalists": formatted_datalists
             },
-            "change_data": result.get("change_data"),
+            "change_data": None,
             "filename": filename,
             "cacheHit": False
         }
         
-        # Save response to output file
-        output_filename = f"{index_symbol}_{timeframe}.json"
-        output_path = os.path.join(output_folder_path, output_filename)
+        # Clean up temporary files
+        try:
+            shutil.rmtree(input_folder_path)
+            shutil.rmtree(output_folder_path)
+        except Exception as e:
+            logger.warning(f"Error cleaning up temporary files: {str(e)}")
         
-        with open(output_path, 'w') as f:
-            json.dump(response, f, indent=2)
-            
         return response
         
     except Exception as e:
         logger.error(f"Error in generate_csv: {str(e)}", exc_info=True)
-        return {"error": str(e)}
+        raise
 
 
 def return_filter_days(timeframe):

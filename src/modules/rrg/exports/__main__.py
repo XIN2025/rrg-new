@@ -8,6 +8,9 @@ import paho.mqtt.client as mqtt
 import shutil
 import time
 from config import REDIS_CONFIG
+import logging
+
+logger = logging.getLogger(__name__)
 
 def main(args):
     st = time.time()
@@ -210,11 +213,22 @@ def read_output_file(args, input_folder_path, output_folder_path, file_name):
                     if not json_data:
                         return False
                         
+                    # Get benchmark data from input CSV
+                    benchmark_data = []
+                    try:
+                        with open(os.path.join(input_folder_path, f"{file_name}.csv"), 'r') as f:
+                            for line in f:
+                                parts = line.strip().split(',')
+                                if len(parts) >= 3 and parts[1].upper() == "CNX500":
+                                    benchmark_data.append(float(parts[2]))
+                    except Exception as e:
+                        logger.warning(f"Error reading benchmark data from CSV: {str(e)}")
+                    
                     # Return the data directly in the expected format
                     result = {
                         "data": {
-                            "benchmark": json_data.get("benchmark", ""),
-                            "indexdata": json_data.get("indexdata", []),
+                            "benchmark": "cnx500",  # Always use lowercase
+                            "indexdata": [f"{x:.2f}" for x in benchmark_data],  # Use actual benchmark data
                             "datalists": json_data.get("datalists", [])
                         },
                         "change_data": None,
