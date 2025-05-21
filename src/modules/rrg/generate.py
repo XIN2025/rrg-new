@@ -42,41 +42,23 @@ def get_market_metadata(symbol) -> pl.DataFrame:
 
 def generate_csv(tickers, date_range, index_symbol, timeframe, channel_name, filename, cache_manager):
     try:
-        # Get absolute paths - use the correct project root
+        logger.info(f"Starting CSV generation with timeframe: {timeframe}")
+        
+        # Get absolute paths
         current_dir = os.path.dirname(os.path.abspath(__file__))
-        project_root = os.path.abspath(os.path.join(current_dir, "../../.."))  # Fixed: go up 3 levels instead of 4
+        project_root = os.path.abspath(os.path.join(current_dir, "../../.."))
         
         # Create unique folder for this run
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         input_folder_name = f"rrg_{timestamp}"
         
-        # Set input and output paths relative to project root
+        # Set paths
         input_folder_path = os.path.join(project_root, "src/modules/rrg/exports/input", input_folder_name)
         output_folder_path = os.path.join(project_root, "src/modules/rrg/exports/output", input_folder_name)
         
-        print(f"[DEBUG] Project root: {project_root}")
-        print(f"[DEBUG] Input folder path: {input_folder_path}")
-        print(f"[DEBUG] Output folder path: {output_folder_path}")
-        
-        # Create base directories first
-        base_input_dir = os.path.join(project_root, "src/modules/rrg/exports/input")
-        base_output_dir = os.path.join(project_root, "src/modules/rrg/exports/output")
-        
-        # Create base directories with proper permissions
-        os.makedirs(base_input_dir, exist_ok=True, mode=0o755)
-        os.makedirs(base_output_dir, exist_ok=True, mode=0o755)
-        
-        # Verify base directories exist
-        if not os.path.exists(base_input_dir) or not os.path.exists(base_output_dir):
-            raise RuntimeError(f"Failed to create base directories: {base_input_dir}, {base_output_dir}")
-        
-        # Create run-specific directories
+        # Create directories
         os.makedirs(input_folder_path, exist_ok=True, mode=0o755)
         os.makedirs(output_folder_path, exist_ok=True, mode=0o755)
-        
-        # Verify run-specific directories exist
-        if not os.path.exists(input_folder_path) or not os.path.exists(output_folder_path):
-            raise RuntimeError(f"Failed to create run directories: {input_folder_path}, {output_folder_path}")
         
         # Get market metadata
         market_metadata = get_market_metadata(tickers)
@@ -85,9 +67,37 @@ def generate_csv(tickers, date_range, index_symbol, timeframe, channel_name, fil
             
         # Get price data
         metadata_store = RRGMetadataStore()
-        price_data = metadata_store.get_stock_prices(tickers, timeframe, date_range)
+        
+        # Convert date_range to filter_days
+        filter_days = None
+        if isinstance(date_range, str):
+            if "month" in date_range.lower():
+                filter_days = 30
+            elif "week" in date_range.lower():
+                filter_days = 7
+            elif "year" in date_range.lower():
+                filter_days = 365
+            else:
+                try:
+                    filter_days = int(date_range.split()[0])
+                except (ValueError, IndexError):
+                    filter_days = 30
+        else:
+            filter_days = 30
+            
+        # Get price data and ensure it's not empty
+        price_data = metadata_store.get_stock_prices(tickers, timeframe, filter_days)
         if price_data.is_empty():
             raise ValueError("No price data found")
+            
+        # Validate price data
+        if "close_price" not in price_data.columns:
+            raise ValueError("Missing close_price column in price data")
+            
+        # Filter out rows with null close prices
+        price_data = price_data.filter(pl.col("close_price").is_not_null())
+        if price_data.is_empty():
+            raise ValueError("No valid price data after filtering nulls")
             
         # Join data
         df = price_data.join(market_metadata, on="symbol", how="left")
@@ -105,59 +115,85 @@ def generate_csv(tickers, date_range, index_symbol, timeframe, channel_name, fil
         
         # Reorder the data to ensure benchmark is first
         df = df.sort(["symbol", "created_at"])
-        df = df.with_columns(
-            pl.col("symbol").cast(pl.Categorical).cat.set_ordering("lexical")
+        
+        # Prepare data for CSV
+        rrg_data = []
+        
+        # Process each symbol
+        for symbol in benchmark_first:
+            symbol_data = df.filter(pl.col("symbol") == symbol)
+            if len(symbol_data) > 0:
+                # Get only the last 50 data points
+                symbol_data = symbol_data.tail(50)
+                
+                # Sort by date to ensure chronological order
+                symbol_data = symbol_data.sort("created_at")
+                
+                # Calculate price changes and previous prices
+                symbol_data = symbol_data.with_columns([
+                    pl.col("close_price").cast(pl.Float64).pct_change().over("symbol").alias("price_change"),
+                    pl.col("close_price").cast(pl.Float64).shift(1).over("symbol").alias("prev_price")
+                ])
+                
+                for row in symbol_data.iter_rows(named=True):
+                    try:
+                        # Format date and time
+                        created_at = row["created_at"]
+                        date_str = created_at.strftime("%Y-%m-%d")
+                        time_str = created_at.strftime("%H:%M:%S")
+                        
+                        # Get the actual price data with validation
+                        close_price = float(row["close_price"]) if row["close_price"] is not None else 0.0
+                        prev_price = float(row["prev_price"]) if row["prev_price"] is not None else close_price
+                        price_change = float(row["price_change"]) if row["price_change"] is not None else 0.0
+                        
+                        # Validate price values
+                        if close_price <= 0:
+                            logger.warning(f"Invalid close price {close_price} for {symbol}, skipping")
+                            continue
+                            
+                        # Create data row in RRG format - exactly matching binary expectations
+                        data_row = [
+                            f"{date_str} {time_str}",  # datetime
+                            str(row["symbol"]),  # symbol
+                            f"{close_price:.2f}",  # close price
+                            str(row.get("security_code", "")),  # security code
+                            f"{prev_price:.2f}",  # previous close
+                            str(row.get("ticker", "")),  # ticker
+                            str(row.get("name", "")),  # name
+                            str(row.get("slug", "")),  # slug
+                            str(row.get("security_type_code", "26"))  # security type code
+                        ]
+                        rrg_data.append(data_row)
+                    except (ValueError, TypeError) as e:
+                        logger.warning(f"Error processing row for {symbol}: {str(e)}, skipping")
+                        continue
+        
+        if not rrg_data:
+            raise ValueError("No valid data points after processing")
+            
+        # Create DataFrame from RRG data
+        rrg_df = pl.DataFrame(rrg_data, schema=[
+            "datetime", "symbol", "close_price", "security_code",
+            "previous_close", "ticker", "name", "slug", "security_type_code"
+        ])
+            
+        # Generate CSV with shorter filename
+        csv_filename = f"{input_folder_name}.csv"
+        csv_path = os.path.join(input_folder_path, csv_filename)
+        
+        # Write CSV without header and with proper formatting
+        rrg_df.write_csv(
+            csv_path,
+            separator=",",
+            quote='"',
+            has_header=False,
+            null_value="",
+            datetime_format="%Y-%m-%d %H:%M:%S"
         )
         
-        # Generate CSV
-        csv_path = csv_generator(df, index_symbol, input_folder_name, input_folder_path)
-        if not csv_path or not os.path.exists(csv_path):
-            raise ValueError(f"Failed to generate CSV file at {csv_path}")
-            
-        print(f"[DEBUG] CSV file generated at: {csv_path}")
-        print(f"[DEBUG] CSV file exists: {os.path.exists(csv_path)}")
-        print(f"[DEBUG] CSV file size: {os.path.getsize(csv_path)} bytes")
-        
-        # Verify the input file exists and has content
-        input_file = os.path.join(input_folder_path, f"{input_folder_name}.csv")
-        if not os.path.exists(input_file):
-            raise ValueError(f"Input file not found at {input_file}")
-            
-        if os.path.getsize(input_file) == 0:
-            raise ValueError(f"Input file is empty at {input_file}")
-            
-        # Verify CSV content
-        with open(input_file, 'r') as f:
-            content = f.read()
-            if not content.strip():
-                raise ValueError("CSV file is empty")
-            
-            # Split into lines and verify each line
-            lines = content.strip().split('\n')
-            if not lines:
-                raise ValueError("CSV file has no content")
-                
-            # Get expected number of columns from header
-            header = lines[0]
-            expected_columns = len(header.split(','))
-            print(f"[DEBUG] Expected columns: {expected_columns}")
-            
-            # Verify each line has the correct number of columns
-            for i, line in enumerate(lines[1:], 1):
-                columns = line.split(',')
-                if len(columns) != expected_columns:
-                    print(f"[DEBUG] Line {i} has {len(columns)} columns, expected {expected_columns}")
-                    print(f"[DEBUG] Line content: {line}")
-                    raise ValueError(f"CSV file has inconsistent number of columns at line {i}")
-            
-            # Verify no line ends with a comma
-            for i, line in enumerate(lines[1:], 1):
-                if line.endswith(','):
-                    print(f"[DEBUG] Line {i} ends with a comma: {line}")
-                    raise ValueError(f"CSV file has trailing comma at line {i}")
-            
         # Set proper permissions on the input file
-        os.chmod(input_file, 0o644)
+        os.chmod(csv_path, 0o644)
         
         # Process with RRG binary
         args = {
@@ -168,18 +204,72 @@ def generate_csv(tickers, date_range, index_symbol, timeframe, channel_name, fil
             "do_publish": True
         }
         
+        # Process with RRG binary
         result = rrg_bin(args)
         if not result or "error" in result:
             raise ValueError(f"RRG binary processing failed: {result.get('error', 'Unknown error')}")
             
-        # Keep the input files for inspection
-        print(f"[DEBUG] Input files preserved in: {input_folder_path}")
-        print(f"[DEBUG] Input file contents: {os.listdir(input_folder_path)}")
+        # Format the response data
+        formatted_datalists = []
+        for item in result.get("datalists", []):
+            formatted_item = {
+                "code": item.get("code", ""),
+                "name": item.get("name", ""),
+                "meaningful_name": item.get("code", ""),
+                "slug": item.get("slug", "").lower().replace(" ", "-"),
+                "ticker": item.get("ticker", ""),
+                "symbol": item.get("symbol", ""),
+                "security_code": item.get("security_code", ""),
+                "security_type_code": float(item.get("security_type_code", 26.0)),
+                "data": []
+            }
             
-        return result
+            # Format data points
+            for point in item.get("data", []):
+                if len(point) >= 9:
+                    try:
+                        # Convert all values to float and format to 2 decimal places
+                        formatted_point = [
+                            point[0],  # date
+                            f"{float(point[1]):.2f}",  # value1
+                            f"{float(point[2]):.2f}",  # value2
+                            f"{float(point[3]):.2f}",  # value3
+                            f"{float(point[4]):.2f}",  # value4
+                            f"{float(point[5]):.2f}",  # value5
+                            f"{float(point[6]):.2f}",  # value6
+                            f"{float(point[7]):.2f}",  # value7
+                            f"{float(point[8]):.2f}"   # value8
+                        ]
+                        formatted_item["data"].append(formatted_point)
+                    except (ValueError, TypeError) as e:
+                        logger.warning(f"Error formatting data point: {str(e)}, skipping")
+                        continue
+            
+            formatted_datalists.append(formatted_item)
+        
+        # Create response structure
+        response = {
+            "data": {
+                "datalists": formatted_datalists,
+                "benchmark": index_symbol.lower(),
+                "indexdata": [f"{float(x):.2f}" for x in result.get("indexdata", [])[:50]]  # Limit to 50 points
+            },
+            "change_data": result.get("change_data"),
+            "filename": filename,
+            "cacheHit": False
+        }
+        
+        # Save response to output file
+        output_filename = f"{index_symbol}_{timeframe}.json"
+        output_path = os.path.join(output_folder_path, output_filename)
+        
+        with open(output_path, 'w') as f:
+            json.dump(response, f, indent=2)
+            
+        return response
         
     except Exception as e:
-        print(f"Error in generate_csv: {str(e)}")
+        logger.error(f"Error in generate_csv: {str(e)}", exc_info=True)
         return {"error": str(e)}
 
 

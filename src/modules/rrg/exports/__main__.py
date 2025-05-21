@@ -21,17 +21,12 @@ def main(args):
     input_folder_path = os.path.join(project_root, "src/modules/rrg/exports/input", input_folder_name)
     output_folder_path = os.path.join(project_root, "src/modules/rrg/exports/output", input_folder_name)
     
-    print(f"[DEBUG] Project root: {project_root}")
-    print(f"[DEBUG] Input folder path: {input_folder_path}")
-    print(f"[DEBUG] Output folder path: {output_folder_path}")
-    
     # Create output directory
     os.makedirs(output_folder_path, exist_ok=True)
 
     # Verify input file exists
     input_file = os.path.join(input_folder_path, f"{input_folder_name}.csv")
     if not os.path.exists(input_file):
-        print(f"Error: Input file not found at {input_file}")
         return {"error": "Input file not found"}
 
     # Get RRG binary path
@@ -39,17 +34,14 @@ def main(args):
     rrgcsv_path = os.path.join(script_dir, "rrgcsv_new")
     
     if not os.path.exists(rrgcsv_path):
-        print(f"Error: RRG binary not found at {rrgcsv_path}")
         return {"error": "RRG binary not found"}
 
     # Ensure the binary is executable
     try:
         os.chmod(rrgcsv_path, 0o755)
         if not os.access(rrgcsv_path, os.X_OK):
-            print(f"Error: RRG binary is not executable at {rrgcsv_path}")
             return {"error": "RRG binary is not executable"}
     except Exception as e:
-        print(f"Error: Could not set executable permissions: {str(e)}")
         return {"error": f"Permission error: {str(e)}"}
 
     # Create a copy of the input file with a simpler name
@@ -62,11 +54,7 @@ def main(args):
         # Write the content to the simple input file
         with open(simple_input_file, 'w') as f:
             f.write(content)
-            
-        print(f"[DEBUG] Created simple input file at: {simple_input_file}")
-        print(f"[DEBUG] Input file size: {os.path.getsize(simple_input_file)} bytes")
     except Exception as e:
-        print(f"Warning: Could not create simple input file: {str(e)}")
         simple_input_file = input_file
 
     # Execute RRG binary with proper paths
@@ -75,9 +63,6 @@ def main(args):
     # Create a temporary config file that generates only two files
     temp_config_path = os.path.join(script_dir, "temp_rrgcsv.conf")
     try:
-        with open(config_path, 'r') as f:
-            config_content = f.read()
-        
         # Create a minimal config that only generates two files
         config_content = """{
     "symbollists": {
@@ -85,22 +70,21 @@ def main(args):
             "1 Day": "Date-1_Day.json"
         }
     },
-    "indexfile": "rrg-index.json"
+    "indexfile": "rrg-index.json",
+    "settings": {
+        "decimal_places": 2,
+        "price_format": "standard",
+        "date_format": "YYYY-MM-DD HH:mm:ss",
+        "timezone": "UTC"
+    }
 }"""
         
         with open(temp_config_path, 'w') as f:
             f.write(config_content)
-            
-        print(f"[DEBUG] Created temporary config file at: {temp_config_path}")
     except Exception as e:
-        print(f"Error creating temporary config: {str(e)}")
         return {"error": f"Config error: {str(e)}"}
     
     command = f"'{rrgcsv_path}' -csvpath '{input_folder_path}' -outputpath '{output_folder_path}' -config '{temp_config_path}'"
-    print(f"[DEBUG] Executing command: {command}")
-    print(f"[DEBUG] Working directory: {script_dir}")
-    print(f"[DEBUG] Config file exists: {os.path.exists(temp_config_path)}")
-    print(f"[DEBUG] Config file contents: {open(temp_config_path).read()}")
 
     try:
         # Run the command with proper environment
@@ -120,14 +104,7 @@ def main(args):
                 env=env
             )
             
-            print(f"[DEBUG] Command return code: {output.returncode}")
-            print(f"[DEBUG] Command stdout: {output.stdout}")
-            print(f"[DEBUG] Command stderr: {output.stderr}")
-            
             if output.returncode != 0:
-                print(f"Error: RRG processing failed with return code {output.returncode}")
-                print(f"STDOUT: {output.stdout}")
-                print(f"STDERR: {output.stderr}")
                 return {"error": f"RRG processing failed: {output.stderr}"}
         finally:
             # Always change back to original directory
@@ -141,10 +118,8 @@ def main(args):
             
         # Check if output directory has files
         output_files = os.listdir(output_folder_path)
-        print(f"[DEBUG] Output directory contents: {output_files}")
         
         if not output_files:
-            print("Error: No output files generated")
             return {"error": "No output files generated"}
             
         # Find the -1_Day file
@@ -152,11 +127,9 @@ def main(args):
         for file in output_files:
             if file.endswith('.json') and '-1_Day.' in file:
                 data_file = file
-                print(f"[DEBUG] Found data file: {file}")
                 break
                 
         if not data_file:
-            print("Error: Could not find data file")
             return {"error": "Could not find data file"}
             
         # Delete any other files except rrg-index.json and the data file
@@ -164,27 +137,20 @@ def main(args):
             if file != data_file and file != "rrg-index.json":
                 try:
                     os.remove(os.path.join(output_folder_path, file))
-                    print(f"[DEBUG] Removed file: {file}")
-                except Exception as e:
-                    print(f"[DEBUG] Could not remove file {file}: {str(e)}")
+                except:
+                    pass
         
         # Try to read the output file
         result = read_output_file(args, input_folder_path, output_folder_path, input_folder_name)
         if not result:
-            print("Error: Failed to read output file")
             return {"error": "Failed to read output file"}
 
-        print(f"RRG processing completed in {time.time() - st:.2f}s")
-        print(f"Input files preserved in: {input_folder_path}")
-        print(f"Input file contents: {os.listdir(input_folder_path)}")
-        
         # Ensure we have the correct structure
         if isinstance(result, dict) and "data" not in result:
             result = {"data": result}
             
         return result
     except Exception as e:
-        print(f"Error: {str(e)}")
         return {"error": str(e)}
 
 def download_file_from_s3(args, input_folder_path, file_name):
@@ -213,14 +179,11 @@ def read_output_file(args, input_folder_path, output_folder_path, file_name):
     os.makedirs(output_folder_path, exist_ok=True)
     
     if not os.path.exists(output_folder_path):
-        print("Error: Output directory not found")
         return False
         
     try:
         files = os.listdir(output_folder_path)
-        print(f"[DEBUG] Files in output directory: {files}")
     except FileNotFoundError:
-        print("Error: Could not access output directory")
         return False
 
     if files:
@@ -229,31 +192,24 @@ def read_output_file(args, input_folder_path, output_folder_path, file_name):
         for file in files:
             if file.endswith('.json') and '-1_Day.' in file:
                 data_file = file
-                print(f"[DEBUG] Found data file: {file}")
                 break
         
         if not data_file:
-            print("Error: Could not find data file")
             return False
             
         output_file = os.path.join(output_folder_path, data_file)
-        print(f"[DEBUG] Reading data file: {output_file}")
 
         try:
             with open(output_file, "r", encoding="utf-8-sig") as file:
                 content = file.read()
                 if not content.strip():
-                    print("Error: Data file is empty")
                     return False
                     
                 try:
                     json_data = json.loads(content)
                     if not json_data:
-                        print("Error: Invalid JSON data in file")
                         return False
                         
-                    print(f"[DEBUG] Raw JSON data: {json.dumps(json_data, indent=2)}")
-                    
                     # Return the data directly in the expected format
                     result = {
                         "data": {
@@ -268,18 +224,14 @@ def read_output_file(args, input_folder_path, output_folder_path, file_name):
                     
                     # Verify we have the required data
                     if not result["data"]["benchmark"] or not result["data"]["indexdata"]:
-                        print("Error: Missing required data fields")
                         return False
                         
-                    print(f"[DEBUG] Final result: {json.dumps(result, indent=2)}")
                     return result
                     
-                except json.JSONDecodeError as e:
-                    print(f"Error: Invalid JSON in file: {str(e)}")
+                except json.JSONDecodeError:
                     return False
                     
-        except Exception as e:
-            print(f"Error reading file: {str(e)}")
+        except Exception:
             return False
             
     return False
