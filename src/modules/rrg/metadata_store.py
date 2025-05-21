@@ -11,6 +11,7 @@ from src.utils.metrics import TimerMetric, DuckDBQueryTimer
 from src.utils.logger import get_logger
 from src.utils.duck_pool import get_duckdb_connection
 from src.modules.rrg.time_utils import return_filter_days
+import time as t
 
 INDIAN_TZ = "Asia/Kolkata"
 
@@ -111,7 +112,7 @@ class RRGMetadataStore:
         logger.debug("[RRG Price Data] Connected to DuckDB")
         
         try:
-            load_start = datetime.now()
+            load_start = t.time()
             logger.info(f"[RRG Price Data] Loading price data for last {self._price_data_days} days...")
             
             # First get the list of index symbols from market_metadata
@@ -233,7 +234,7 @@ class RRGMetadataStore:
             logger.info(f"[RRG Price Data] Data validation completed")
             logger.info(f"[RRG Price Data] EOD stock data max date: {self._eod_stock_data_df['created_at'].max()}")
             
-            load_duration = (datetime.now() - load_start).total_seconds()
+            load_duration = (t.time() - load_start)
             logger.info(f"[RRG Price Data] Price data loading completed in {load_duration:.2f} seconds")
             
             return True
@@ -381,28 +382,178 @@ class RRGMetadataStore:
             return self._market_metadata_df.clone()
         return self._market_metadata_df.filter(pl.col("symbol").is_in(symbols)).clone()
 
-    def get_stock_prices(self, tickers, timeframe, filter_days=30):
-        """
-        Returns stock price data for the specified tickers and timeframe.
-        
-        Args:
-            tickers: List of tickers to get data for
-            timeframe: Timeframe for the data (e.g., 'daily', 'weekly', 'monthly')
-            filter_days: Number of days of historical data to return
-        """
-        self.ensure_price_data_loaded()
-        
-        # Filter the data
-        df = self._stock_prices_df.filter(
-            pl.col("ticker").is_in(tickers) if tickers else True
-        )
-        
-        # Filter by date if needed
-        if filter_days:
-            cutoff_date = datetime.now() - timedelta(days=filter_days)
-            df = df.filter(pl.col("created_at") >= cutoff_date)
-        
-        return df.clone()
+    def get_stock_prices(self, symbols, timeframe="daily", filter_days=None):
+        """Get stock prices from DuckDB."""
+        with TimerMetric("get_stock_prices", "rrg_metadata"):
+            try:
+                start_time = t.time()
+                
+                # Get DuckDB connection
+                dd_con = get_duckdb_connection()
+                
+                # Calculate filter days if not provided
+                if filter_days is None:
+                    filter_days = return_filter_days(timeframe)
+                
+                # Get index symbols
+                index_symbols = dd_con.execute("""
+                    SELECT DISTINCT symbol 
+                    FROM public.market_metadata 
+                    WHERE security_type_code IN ('5', '26')
+                """).fetchall()
+                
+                # Query for stock prices with proper deduplication
+                stock_price_query = f"""
+                WITH hourly_prices AS (
+                    SELECT 
+                        DATE_TRUNC('hour', created_at) as hour,
+                        symbol,
+                        FIRST_VALUE(current_price) OVER (
+                            PARTITION BY symbol, DATE_TRUNC('hour', created_at)
+                            ORDER BY created_at DESC
+                        ) as close_price,
+                        FIRST_VALUE(security_code) OVER (
+                            PARTITION BY symbol, DATE_TRUNC('hour', created_at)
+                            ORDER BY created_at DESC
+                        ) as security_code,
+                        FIRST_VALUE(created_at) OVER (
+                            PARTITION BY symbol, DATE_TRUNC('hour', created_at)
+                            ORDER BY created_at DESC
+                        ) as created_at
+                    FROM public.stock_prices
+                    WHERE created_at >= CURRENT_DATE - INTERVAL '{filter_days}' DAY
+                    AND symbol IN ({','.join([f"'{s[0]}'" for s in index_symbols])})
+                    AND current_price > 0
+                    AND current_price < 1000000
+                ),
+                unique_prices AS (
+                    SELECT DISTINCT
+                        created_at,
+                        symbol,
+                        close_price,
+                        security_code
+                    FROM hourly_prices
+                ),
+                final_prices AS (
+                    SELECT 
+                        created_at,
+                        symbol,
+                        close_price,
+                        security_code,
+                        ROW_NUMBER() OVER (PARTITION BY symbol, DATE_TRUNC('hour', created_at) ORDER BY created_at DESC) as rn
+                    FROM unique_prices
+                )
+                SELECT 
+                    created_at,
+                    symbol,
+                    close_price,
+                    security_code
+                FROM final_prices
+                WHERE rn = 1
+                ORDER BY created_at DESC, symbol
+                """
+                
+                # Query for EOD stock data with proper deduplication
+                eod_stock_query = f"""
+                WITH daily_prices AS (
+                    SELECT 
+                        DATE_TRUNC('day', created_at) as day,
+                        symbol,
+                        FIRST_VALUE(close_price) OVER (
+                            PARTITION BY symbol, DATE_TRUNC('day', created_at)
+                            ORDER BY created_at DESC
+                        ) as close_price,
+                        FIRST_VALUE(security_code) OVER (
+                            PARTITION BY symbol, DATE_TRUNC('day', created_at)
+                            ORDER BY created_at DESC
+                        ) as security_code,
+                        FIRST_VALUE(created_at) OVER (
+                            PARTITION BY symbol, DATE_TRUNC('day', created_at)
+                            ORDER BY created_at DESC
+                        ) as created_at
+                    FROM public.eod_stock_data
+                    WHERE created_at >= CURRENT_DATE - INTERVAL '{filter_days}' DAY
+                    AND symbol IN ({','.join([f"'{s[0]}'" for s in index_symbols])})
+                    AND close_price > 0
+                    AND close_price < 1000000
+                ),
+                unique_prices AS (
+                    SELECT DISTINCT
+                        created_at,
+                        symbol,
+                        close_price,
+                        security_code
+                    FROM daily_prices
+                ),
+                final_prices AS (
+                    SELECT 
+                        created_at,
+                        symbol,
+                        close_price,
+                        security_code,
+                        ROW_NUMBER() OVER (PARTITION BY symbol, DATE_TRUNC('day', created_at) ORDER BY created_at DESC) as rn
+                    FROM unique_prices
+                )
+                SELECT 
+                    created_at,
+                    symbol,
+                    close_price,
+                    security_code
+                FROM final_prices
+                WHERE rn = 1
+                ORDER BY created_at DESC, symbol
+                """
+                
+                # Execute queries
+                stock_prices = dd_con.execute(stock_price_query).fetchall()
+                eod_stock_data = dd_con.execute(eod_stock_query).fetchall()
+                
+                # Convert to DataFrames
+                df1 = pl.DataFrame(stock_prices, schema=["created_at", "symbol", "close_price", "security_code"])
+                df2 = pl.DataFrame(eod_stock_data, schema=["created_at", "symbol", "close_price", "security_code"])
+                
+                # Combine and sort
+                df = pl.concat([df1, df2])
+                
+                # Remove duplicates based on symbol and timestamp
+                df = df.unique(subset=["symbol", "created_at"], keep="last")
+                
+                # Sort by timestamp and symbol
+                df = df.sort(["created_at", "symbol"])
+                
+                # Join with market_metadata to get additional fields
+                metadata_df = dd_con.execute("""
+                    SELECT symbol, name, slug, security_type_code, ticker
+                    FROM public.market_metadata
+                """).fetchall()
+                metadata_df = pl.DataFrame(metadata_df, schema=["symbol", "name", "slug", "security_type_code", "ticker"])
+                
+                df = df.join(metadata_df, on="symbol", how="left")
+                
+                # Validate data
+                if df.is_empty():
+                    raise ValueError("No price data found")
+                
+                # Check for required columns
+                required_columns = ["created_at", "symbol", "close_price", "security_code", "name", "slug", "security_type_code", "ticker"]
+                for col in required_columns:
+                    if col not in df.columns:
+                        raise ValueError(f"Missing required column: {col}")
+                
+                # Filter out rows with null values
+                df = df.filter(pl.col("close_price").is_not_null())
+                
+                # Format the data but keep datetime as datetime
+                df = df.with_columns([
+                    pl.col("close_price").round(2).cast(pl.Utf8),
+                    pl.col("security_type_code").cast(pl.Utf8)
+                ])
+                
+                return df
+                
+            except Exception as e:
+                logger.error(f"[RRG Price Data] Error loading price data: {str(e)}", exc_info=True)
+                raise
 
     def get_eod_stock_data(self, tickers=None, symbols=None, filter_days=None):
         """

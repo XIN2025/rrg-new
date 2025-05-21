@@ -90,6 +90,10 @@ def generate_csv(tickers, date_range, index_symbol, timeframe, channel_name, fil
         if price_data.is_empty():
             raise ValueError("No price data found")
             
+        # Log raw price data
+        logger.info("Raw price data sample:")
+        logger.info(price_data.head(5).to_dicts())
+            
         # Validate price data
         if "close_price" not in price_data.columns:
             raise ValueError("Missing close_price column in price data")
@@ -103,6 +107,10 @@ def generate_csv(tickers, date_range, index_symbol, timeframe, channel_name, fil
         df = price_data.join(market_metadata, on="symbol", how="left")
         if df.is_empty():
             raise ValueError("No data after joining price and metadata")
+            
+        # Log joined data
+        logger.info("Joined data sample:")
+        logger.info(df.head(5).to_dicts())
             
         # Ensure benchmark symbol exists and is first
         benchmark_data = df.filter(pl.col("symbol") == index_symbol)
@@ -135,6 +143,10 @@ def generate_csv(tickers, date_range, index_symbol, timeframe, channel_name, fil
                     pl.col("close_price").cast(pl.Float64).shift(1).over("symbol").alias("prev_price")
                 ])
                 
+                # Log processed symbol data
+                logger.info(f"Processed data for symbol {symbol}:")
+                logger.info(symbol_data.head(5).to_dicts())
+                
                 for row in symbol_data.iter_rows(named=True):
                     try:
                         # Format date and time
@@ -157,11 +169,11 @@ def generate_csv(tickers, date_range, index_symbol, timeframe, channel_name, fil
                             f"{date_str} {time_str}",  # datetime
                             str(row["symbol"]),  # symbol
                             f"{close_price:.2f}",  # close price
-                            str(row.get("security_code", "")),  # security code
+                            str(row.get("security_code", row["symbol"])),  # security code
                             f"{prev_price:.2f}",  # previous close
-                            str(row.get("ticker", "")),  # ticker
-                            str(row.get("name", "")),  # name
-                            str(row.get("slug", "")),  # slug
+                            str(row.get("ticker", row["symbol"])),  # ticker
+                            str(row.get("name", row["symbol"])),  # name
+                            str(row.get("slug", row["symbol"].lower().replace(" ", "-"))),  # slug
                             str(row.get("security_type_code", "26"))  # security type code
                         ]
                         rrg_data.append(data_row)
@@ -177,6 +189,10 @@ def generate_csv(tickers, date_range, index_symbol, timeframe, channel_name, fil
             "datetime", "symbol", "close_price", "security_code",
             "previous_close", "ticker", "name", "slug", "security_type_code"
         ])
+        
+        # Log final RRG data
+        logger.info("Final RRG data sample:")
+        logger.info(rrg_df.head(5).to_dicts())
             
         # Generate CSV with shorter filename
         csv_filename = f"{input_folder_name}.csv"
@@ -195,6 +211,18 @@ def generate_csv(tickers, date_range, index_symbol, timeframe, channel_name, fil
         # Set proper permissions on the input file
         os.chmod(csv_path, 0o644)
         
+        # Also create a copy with the simple name for the RRG binary
+        simple_csv_path = os.path.join(input_folder_path, "input.csv")
+        rrg_df.write_csv(
+            simple_csv_path,
+            separator=",",
+            quote='"',
+            has_header=False,
+            null_value="",
+            datetime_format="%Y-%m-%d %H:%M:%S"
+        )
+        os.chmod(simple_csv_path, 0o644)
+        
         # Process with RRG binary
         args = {
             "input_folder_name": input_folder_name,
@@ -209,64 +237,7 @@ def generate_csv(tickers, date_range, index_symbol, timeframe, channel_name, fil
         if not result or "error" in result:
             raise ValueError(f"RRG binary processing failed: {result.get('error', 'Unknown error')}")
             
-        # Format the response data
-        formatted_datalists = []
-        for item in result.get("data", {}).get("datalists", []):
-            formatted_item = {
-                "code": item.get("code", ""),
-                "name": item.get("name", ""),
-                "meaningful_name": item.get("code", ""),
-                "slug": item.get("slug", "").lower().replace(" ", "-"),
-                "ticker": item.get("ticker", ""),
-                "symbol": item.get("symbol", ""),
-                "security_code": item.get("security_code", ""),
-                "security_type_code": float(item.get("security_type_code", 26.0)),
-                "data": []
-            }
-            
-            # Format data points
-            for point in item.get("data", []):
-                if len(point) >= 9:
-                    try:
-                        # Convert all values to float and format to 2 decimal places
-                        formatted_point = [
-                            point[0],  # date
-                            f"{float(point[1]):.2f}",  # value1
-                            f"{float(point[2]):.2f}",  # value2
-                            f"{float(point[3]):.2f}",  # value3
-                            f"{float(point[4]):.2f}",  # value4
-                            f"{float(point[5]):.2f}",  # value5
-                            f"{float(point[6]):.2f}",  # value6
-                            f"{float(point[7]):.2f}",  # value7
-                            f"{float(point[8]):.2f}"   # value8
-                        ]
-                        formatted_item["data"].append(formatted_point)
-                    except (ValueError, TypeError) as e:
-                        logger.warning(f"Error formatting data point: {str(e)}, skipping")
-                        continue
-            
-            formatted_datalists.append(formatted_item)
-        
-        # Create response structure
-        response = {
-            "data": {
-                "benchmark": result.get("data", {}).get("benchmark", "").lower(),
-                "indexdata": [f"{float(x):.2f}" for x in result.get("data", {}).get("indexdata", [])],
-                "datalists": formatted_datalists
-            },
-            "change_data": None,
-            "filename": filename,
-            "cacheHit": False
-        }
-        
-        # Clean up temporary files
-        try:
-            shutil.rmtree(input_folder_path)
-            shutil.rmtree(output_folder_path)
-        except Exception as e:
-            logger.warning(f"Error cleaning up temporary files: {str(e)}")
-        
-        return response
+        return result
         
     except Exception as e:
         logger.error(f"Error in generate_csv: {str(e)}", exc_info=True)
@@ -542,12 +513,37 @@ def do_function(df: pl.DataFrame, ticker, filename, channel_name):
                     if "datalists" in output_data:
                         for item in output_data["datalists"]:
                             if "data" in item:
-                                # Format each data point to have 9 elements
+                                # Log raw data for debugging
+                                logger.info(f"Raw data for {item.get('code', 'unknown')}:")
+                                for point in item["data"][:5]:  # Log first 5 points
+                                    logger.info(f"Data point: {point}")
+                                
+                                # Format each data point
                                 formatted_data = []
                                 for point in item["data"]:
-                                    if len(point) < 9:
-                                        point = point + ["0"] * (9 - len(point))
-                                    formatted_data.append(point)
+                                    # Ensure we have the minimum required elements
+                                    if len(point) < 3:  # We need at least datetime, ratio, and momentum
+                                        logger.warning(f"Invalid data point format: {point}, skipping")
+                                        continue
+                                        
+                                    # Format the data point
+                                    formatted_point = [
+                                        point[0],  # datetime
+                                        f"{float(point[1]):.2f}" if point[1] else "0.00",  # ratio
+                                        f"{float(point[2]):.2f}" if point[2] else "0.00",  # momentum
+                                    ]
+                                    
+                                    # Add additional fields if they exist
+                                    if len(point) > 3:
+                                        formatted_point.extend(point[3:])
+                                    
+                                    formatted_data.append(formatted_point)
+                                
+                                # Log formatted data for debugging
+                                logger.info(f"Formatted data for {item.get('code', 'unknown')}:")
+                                for point in formatted_data[:5]:  # Log first 5 points
+                                    logger.info(f"Formatted point: {point}")
+                                
                                 item["data"] = formatted_data
                                 
                                 # Add required fields if missing

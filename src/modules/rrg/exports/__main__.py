@@ -60,9 +60,6 @@ def main(args):
     except Exception as e:
         simple_input_file = input_file
 
-    # Execute RRG binary with proper paths
-    config_path = os.path.join(script_dir, "rrgcsv.conf")
-    
     # Create a temporary config file that generates only two files
     temp_config_path = os.path.join(script_dir, "temp_rrgcsv.conf")
     try:
@@ -78,7 +75,31 @@ def main(args):
         "decimal_places": 2,
         "price_format": "standard",
         "date_format": "YYYY-MM-DD HH:mm:ss",
-        "timezone": "UTC"
+        "timezone": "UTC",
+        "process_all_symbols": true,
+        "include_benchmark": true,
+        "input_file": "input.csv",
+        "output_format": "json",
+        "data_points": 50,
+        "calculate_relative_strength": true,
+        "calculate_momentum": true,
+        "calculate_roc": true,
+        "calculate_ma": true,
+        "calculate_std": true,
+        "calculate_zscore": true,
+        "calculate_rs_ratio": true,
+        "calculate_rs_momentum": true,
+        "benchmark_symbol": "CNX500",
+        "use_benchmark_for_rs": true,
+        "use_benchmark_for_momentum": true,
+        "use_benchmark_for_roc": true,
+        "use_benchmark_for_ma": true,
+        "use_benchmark_for_std": true,
+        "use_benchmark_for_zscore": true,
+        "use_benchmark_for_rs_ratio": true,
+        "use_benchmark_for_rs_momentum": true,
+        "preserve_metadata": true,
+        "metadata_fields": ["symbol", "ticker", "name", "slug", "security_code", "security_type_code"]
     }
 }"""
         
@@ -109,6 +130,11 @@ def main(args):
             
             if output.returncode != 0:
                 return {"error": f"RRG processing failed: {output.stderr}"}
+                
+            # Log the output for debugging
+            logger.debug(f"RRG binary output: {output.stdout}")
+            if output.stderr:
+                logger.warning(f"RRG binary warnings: {output.stderr}")
         finally:
             # Always change back to original directory
             os.chdir(original_dir)
@@ -224,12 +250,77 @@ def read_output_file(args, input_folder_path, output_folder_path, file_name):
                     except Exception as e:
                         logger.warning(f"Error reading benchmark data from CSV: {str(e)}")
                     
+                    # Format the datalists properly
+                    formatted_datalists = []
+                    for item in json_data.get("datalists", []):
+                        # Get the symbol from the data points
+                        symbol = None
+                        if item.get("data") and len(item["data"]) > 0:
+                            # Try to get symbol from the first data point
+                            first_point = item["data"][0]
+                            if len(first_point) >= 2:
+                                symbol = first_point[1]  # Symbol should be in the second position
+                        
+                        # Get metadata from the original data
+                        metadata = {}
+                        try:
+                            with open(os.path.join(input_folder_path, f"{file_name}.csv"), 'r') as f:
+                                for line in f:
+                                    parts = line.strip().split(',')
+                                    if len(parts) >= 3 and parts[1] == symbol:
+                                        metadata = {
+                                            "code": parts[1],
+                                            "name": parts[1],
+                                            "ticker": parts[1],
+                                            "slug": parts[1].lower().replace(" ", "-"),
+                                            "security_code": parts[1],
+                                            "security_type_code": 26.0
+                                        }
+                                        break
+                        except Exception as e:
+                            logger.warning(f"Error reading metadata from CSV: {str(e)}")
+                        
+                        formatted_item = {
+                            "code": metadata.get("code", symbol or item.get("code", "")),
+                            "name": metadata.get("name", symbol or item.get("name", "")),
+                            "meaningful_name": metadata.get("name", symbol or item.get("meaningful_name", "")),
+                            "slug": metadata.get("slug", item.get("slug", "").lower().replace(" ", "-")),
+                            "ticker": metadata.get("ticker", symbol or item.get("ticker", "")),
+                            "symbol": symbol or item.get("symbol", ""),
+                            "security_code": metadata.get("security_code", item.get("security_code", "")),
+                            "security_type_code": float(metadata.get("security_type_code", item.get("security_type_code", 26.0))),
+                            "data": []
+                        }
+                        
+                        # Format data points with actual values
+                        for point in item.get("data", []):
+                            if len(point) >= 9:
+                                try:
+                                    # Convert all values to float and format to 2 decimal places
+                                    formatted_point = [
+                                        point[0],  # date
+                                        f"{float(point[1]):.2f}",  # value1
+                                        f"{float(point[2]):.2f}",  # value2
+                                        f"{float(point[3]):.2f}",  # value3
+                                        f"{float(point[4]):.2f}",  # value4
+                                        f"{float(point[5]):.2f}",  # value5
+                                        f"{float(point[6]):.2f}",  # value6
+                                        f"{float(point[7]):.2f}",  # value7
+                                        f"{float(point[8]):.2f}"   # value8
+                                    ]
+                                    formatted_item["data"].append(formatted_point)
+                                except (ValueError, TypeError) as e:
+                                    logger.warning(f"Error formatting data point: {str(e)}, skipping")
+                                    continue
+                        
+                        formatted_datalists.append(formatted_item)
+                    
                     # Return the data directly in the expected format
                     result = {
                         "data": {
                             "benchmark": "cnx500",  # Always use lowercase
                             "indexdata": [f"{x:.2f}" for x in benchmark_data],  # Use actual benchmark data
-                            "datalists": json_data.get("datalists", [])
+                            "datalists": formatted_datalists
                         },
                         "change_data": None,
                         "filename": file_name,
