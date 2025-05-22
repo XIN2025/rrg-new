@@ -24,15 +24,29 @@ async def get_rrg_data(
     request: RrgRequest,
     # current_user: str = Depends(get_current_user)
 ):
+    """Get RRG data for the specified request."""
     with RRGRequestMetrics(request.timeframe, request.index_symbol, request.date_range):
         with TimerMetric("get_rrg_data_endpoint", "rrg_router"):
             start_time = time.time()
             logger.info(f"Request received: index={request.index_symbol}, timeframe={request.timeframe}, date_range={request.date_range}")
             
             try:
+                # Validate request
+                if not request.index_symbol or not request.timeframe:
+                    raise HTTPException(status_code=400, detail="Index symbol and timeframe are required")
+                
+                # Get data from service
                 result = await service.get_rrg_data(request)
+                
+                # Log success
                 logger.info(f"Request completed in {time.time() - start_time:.2f}s")
                 return result
+                
+            except ValueError as e:
+                record_rrg_error("validation_error")
+                logger.error(f"Validation error: {str(e)}", exc_info=True)
+                raise HTTPException(status_code=400, detail=str(e))
+                
             except Exception as e:
                 record_rrg_error("endpoint_error")
                 logger.error(f"Error generating RRG data: {str(e)}", exc_info=True)

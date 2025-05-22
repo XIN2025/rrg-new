@@ -9,7 +9,6 @@ from prometheus_client import Summary, Counter, Gauge
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("celery")
 
-
 # Create Celery app
 celery_app = Celery(
     'fastapi_rrg',
@@ -30,6 +29,7 @@ celery_app.conf.update(
     task_time_limit=70, 
     worker_max_tasks_per_child=100,
     broker_transport_options={'visibility_timeout': 70},
+    beat_scheduler='django_celery_beat.schedulers:DatabaseScheduler',
     beat_schedule={
         'sync-stock-prices': {
             'task': 'run_stock_prices_sync',

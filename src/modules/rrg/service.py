@@ -112,7 +112,8 @@ class RRGService:
                 return RrgResponse(
                     status="success",
                     data=resp["data"],
-                    filename=filename
+                    filename=filename,
+                    cacheHit=False
                 )
                 
             except Exception as e:

@@ -3,14 +3,17 @@
 # Create logs directory if it doesn't exist
 mkdir -p logs
 
+# Set Redis URL
+export CELERY_REDIS_URL="redis://localhost:6379/0"
+
 # Start the Celery worker
 echo "Starting Celery worker..."
 python -m celery -A src.celery_app worker -Q celery,data_processing --loglevel=INFO > logs/celery_worker.log 2>&1 &
 WORKER_PID=$!
 
-
+# Start Celery beat scheduler
 echo "Starting Celery beat scheduler..."
-python -m celery -A src.celery_app beat --loglevel=INFO > logs/celery_beat.log 2>&1 &
+python -m celery -A src.celery_app beat --loglevel=INFO --scheduler=django_celery_beat.schedulers:DatabaseScheduler > logs/celery_beat.log 2>&1 &
 BEAT_PID=$!
 
 echo "Celery worker PID: $WORKER_PID"
@@ -32,4 +35,4 @@ cleanup() {
 trap cleanup SIGINT SIGTERM
 
 echo "Press Ctrl+C to stop Celery processes"
-tail -f logs/celery_worker.log 
+tail -f logs/celery_worker.log

@@ -43,6 +43,10 @@ def refresh_metadata():
     """Forces a refresh of all metadata tables"""
     return get_metadata_store().refresh_metadata()
 
+def refresh_price_data(days=None):
+    """Forces a refresh of price data"""
+    return get_metadata_store().refresh_price_data(days)
+
 def ensure_price_data_loaded(days=None):
     """Ensures that price data is loaded if it hasn't been already"""
     return get_metadata_store().ensure_price_data_loaded(days)

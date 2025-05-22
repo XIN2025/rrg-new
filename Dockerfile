@@ -14,16 +14,16 @@ RUN apt-get update && apt-get install -y \
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
-
 COPY pyproject.toml .
-
-COPY . .
+COPY requirements.txt .
 
 RUN useradd -m -u 1000 appuser
 
 RUN uv sync
 
 ENV PATH="/app/.venv/bin:$PATH"
+
+COPY . .
 
 RUN chown -R appuser:appuser /app
 
