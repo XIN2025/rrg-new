@@ -19,6 +19,7 @@ from src.utils.duck_pool import get_duckdb_connection
 from src.modules.rrg.metadata_store import RRGMetadataStore
 from src.modules.rrg.time_utils import return_filter_days, split_time
 import logging
+from src.utils.clickhouse import get_clickhouse_connection
 
 # Configure logger to only show errors
 logger = get_logger("rrg_generate")
@@ -42,6 +43,128 @@ def get_market_metadata(symbols) -> pl.DataFrame:
             raise
 
 
+def check_table_data():
+    """Check the actual data in our tables."""
+    try:
+        conn = get_duckdb_connection()
+        
+        # Check stock_prices table
+        stock_prices = conn.sql("""
+            SELECT 
+                symbol,
+                ticker,
+                current_price,
+                created_at,
+                security_code
+            FROM public.stock_prices
+            WHERE current_price > 0
+            ORDER BY created_at DESC
+            LIMIT 5
+        """).fetchall()
+        
+        # Check eod_stock_data table
+        eod_data = conn.sql("""
+            SELECT 
+                symbol,
+                ticker,
+                close_price,
+                created_at,
+                security_code
+            FROM public.eod_stock_data
+            WHERE close_price > 0
+            ORDER BY created_at DESC
+            LIMIT 5
+        """).fetchall()
+        
+        # Check market_metadata table
+        metadata = conn.sql("""
+            SELECT 
+                symbol,
+                ticker,
+                security_type_code,
+                name,
+                slug
+            FROM public.market_metadata
+            WHERE security_type_code IN ('5', '26')
+            LIMIT 5
+        """).fetchall()
+        
+        logger.info("=== Table Data Check ===")
+        logger.info("\nStock Prices Table (Latest 5 rows):")
+        for row in stock_prices:
+            logger.info(f"Symbol: {row[0]}, Ticker: {row[1]}, Price: {row[2]}, Date: {row[3]}, Code: {row[4]}")
+            
+        logger.info("\nEOD Stock Data Table (Latest 5 rows):")
+        for row in eod_data:
+            logger.info(f"Symbol: {row[0]}, Ticker: {row[1]}, Price: {row[2]}, Date: {row[3]}, Code: {row[4]}")
+            
+        logger.info("\nMarket Metadata Table (Sample):")
+        for row in metadata:
+            logger.info(f"Symbol: {row[0]}, Ticker: {row[1]}, Type: {row[2]}, Name: {row[3]}, Slug: {row[4]}")
+            
+        return {
+            "stock_prices": stock_prices,
+            "eod_data": eod_data,
+            "metadata": metadata
+        }
+    except Exception as e:
+        logger.error(f"Error checking table data: {str(e)}", exc_info=True)
+        return None
+
+
+def check_clickhouse_data():
+    """Check data in ClickHouse."""
+    try:
+        conn = get_clickhouse_connection()
+        
+        # Check current_stock_price table
+        current_prices = conn.execute("""
+            SELECT 
+                symbol,
+                ticker,
+                current_price as close_price,
+                created_at,
+                security_code,
+                previous_close
+            FROM indiacharts.current_stock_price
+            WHERE current_price > 0
+            ORDER BY created_at DESC
+            LIMIT 5
+        """).fetchall()
+        
+        # Check historical_stock_price table
+        historical_prices = conn.execute("""
+            SELECT 
+                symbol,
+                ticker,
+                close_price,
+                created_at,
+                security_code,
+                previous_close
+            FROM indiacharts.historical_stock_price
+            WHERE close_price > 0
+            ORDER BY created_at DESC
+            LIMIT 5
+        """).fetchall()
+        
+        logger.info("=== ClickHouse Data Check ===")
+        logger.info("\nCurrent Stock Prices (Latest 5 rows):")
+        for row in current_prices:
+            logger.info(f"Symbol: {row[0]}, Ticker: {row[1]}, Price: {row[2]}, Date: {row[3]}, Code: {row[4]}")
+            
+        logger.info("\nHistorical Stock Prices (Latest 5 rows):")
+        for row in historical_prices:
+            logger.info(f"Symbol: {row[0]}, Ticker: {row[1]}, Price: {row[2]}, Date: {row[3]}, Code: {row[4]}")
+            
+        return {
+            "current_prices": current_prices,
+            "historical_prices": historical_prices
+        }
+    except Exception as e:
+        logger.warning(f"Could not connect to ClickHouse, continuing with DuckDB data only: {str(e)}")
+        return None
+
+
 def generate_csv(tickers, date_range, index_symbol, timeframe, channel_name, filename, cache_manager):
     """
     Generate CSV data for RRG analysis.
@@ -49,7 +172,7 @@ def generate_csv(tickers, date_range, index_symbol, timeframe, channel_name, fil
     with TimerMetric("generate_csv", "rrg_generate"):
         try:
             # Get market metadata first
-            metadata_df = get_market_metadata(tickers)
+            metadata_df = get_market_metadata(tickers + [index_symbol])
             
             # Get DuckDB connection
             conn = get_duckdb_connection()
@@ -66,9 +189,9 @@ def generate_csv(tickers, date_range, index_symbol, timeframe, channel_name, fil
             else:
                 days = int(date_range)
             
-            # Process data for each ticker
+            # Process data for each ticker including index
             processed_data = []
-            for ticker in tickers:
+            for ticker in tickers + [index_symbol]:
                 try:
                     # Get data for ticker
                     ticker_data = get_ticker_data(ticker, conn, days)
@@ -96,6 +219,79 @@ def generate_csv(tickers, date_range, index_symbol, timeframe, channel_name, fil
             with open(output_file, "w", encoding="utf-8") as f:
                 json.dump(formatted_data, f, indent=2)
             
+            # Create input CSV file for RRG binary
+            input_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "exports", "input", filename)
+            os.makedirs(input_dir, exist_ok=True)
+            
+            # Create CSV with proper format
+            csv_data = []
+            
+            # Row 1: Index symbol and empty cells
+            csv_data.append([index_symbol] + [""] * (len(tickers)))
+            
+            # Row 2: Column headers
+            csv_data.append(["column1"] + tickers)
+            
+            # Row 3: URLs
+            urls = []
+            for ticker in tickers:
+                metadata = metadata_df.filter(pl.col("ticker") == ticker)
+                if not metadata.is_empty():
+                    slug = metadata["slug"][0]
+                    urls.append(f"https://strike-analytics-dev.netlify.app/stocks/{slug}")
+                else:
+                    urls.append(f"https://strike-analytics-dev.netlify.app/stocks/{ticker.lower().replace(' ', '-')}")
+            csv_data.append(["URL"] + urls)
+            
+            # Row 4: Names
+            names = []
+            for ticker in tickers:
+                metadata = metadata_df.filter(pl.col("ticker") == ticker)
+                if not metadata.is_empty():
+                    name = metadata["name"][0]
+                    if "National Stock Exchange" in name:
+                        names.append(ticker.lower().replace(" ", "_"))
+                    else:
+                        names.append(name)
+                else:
+                    names.append(ticker)
+            csv_data.append(["Name"] + names)
+            
+            # Get all unique dates
+            dates = combined_data["created_at"].unique().sort()
+            
+            # Get index data first
+            index_data = combined_data.filter(pl.col("ticker") == index_symbol)
+            
+            # Data rows: Dates and prices
+            for date in dates:
+                row = [date.strftime("%Y-%m-%d")]
+                
+                # Add index price first
+                index_price = index_data.filter(pl.col("created_at") == date)
+                if not index_price.is_empty():
+                    row.append(str(index_price["close_price"][0]))
+                else:
+                    row.append("")
+                
+                # Add other ticker prices
+                for ticker in tickers:
+                    ticker_data = combined_data.filter(
+                        (pl.col("ticker") == ticker) & 
+                        (pl.col("created_at") == date)
+                    )
+                    if not ticker_data.is_empty():
+                        row.append(str(ticker_data["close_price"][0]))
+                    else:
+                        row.append("")
+                csv_data.append(row)
+            
+            # Write CSV file
+            csv_path = os.path.join(input_dir, f"{filename}.csv")
+            with open(csv_path, "w", encoding="utf-8") as f:
+                for row in csv_data:
+                    f.write("\t".join(row) + "\n")
+            
             return {
                 "data": formatted_data,
                 "filename": filename
@@ -109,25 +305,103 @@ def generate_csv(tickers, date_range, index_symbol, timeframe, channel_name, fil
 def get_ticker_data(ticker: str, conn, date_range: int = 3650) -> pl.DataFrame:
     """Get data for a specific ticker."""
     try:
-        # Calculate the date range
-        end_date = datetime.now(timezone.utc)
-        start_date = end_date - timedelta(days=date_range)
+        # First check if the ticker exists in market_metadata
+        metadata_check = conn.sql(f"""
+            SELECT symbol, ticker, security_type_code, name
+            FROM public.market_metadata
+            WHERE ticker = '{ticker}'
+        """).fetchall()
         
-        query = f"""
+        if not metadata_check:
+            logger.error(f"Ticker {ticker} not found in market_metadata")
+            return None
+            
+        logger.info(f"Found metadata for {ticker}: {metadata_check[0]}")
+        
+        # Define the required columns that all DataFrames should have
+        required_columns = ["created_at", "symbol", "close_price", "security_code", "ticker", "previous_close"]
+        
+        # Query for stock prices
+        stock_price_query = f"""
         SELECT 
             created_at,
+            symbol,
             current_price as close_price,
-            previous_close,
             security_code,
+            previous_close,
             ticker
         FROM public.stock_prices 
         WHERE ticker = '{ticker}'
-        AND created_at >= '{start_date.strftime('%Y-%m-%d %H:%M:%S')}'
-        AND created_at <= '{end_date.strftime('%Y-%m-%d %H:%M:%S')}'
         AND current_price > 0
-        ORDER BY created_at ASC
+        AND current_price < 1000000
+        AND created_at >= CURRENT_DATE - INTERVAL '{date_range} days'
         """
-        df = conn.sql(query).pl()
+        
+        # Query for EOD data
+        eod_query = f"""
+        SELECT 
+            created_at,
+            symbol,
+            close_price,
+            security_code,
+            previous_close,
+            ticker
+        FROM public.eod_stock_data
+        WHERE ticker = '{ticker}'
+        AND close_price > 0
+        AND close_price < 1000000
+        AND created_at >= CURRENT_DATE - INTERVAL '{date_range} days'
+        """
+        
+        # Execute queries
+        stock_prices = conn.sql(stock_price_query).pl()
+        eod_data = conn.sql(eod_query).pl()
+        
+        logger.info(f"Stock prices for {ticker}: {len(stock_prices)} rows")
+        if not stock_prices.is_empty():
+            logger.info(f"Sample stock price: {stock_prices.head(1).to_dicts()}")
+            
+        logger.info(f"EOD data for {ticker}: {len(eod_data)} rows")
+        if not eod_data.is_empty():
+            logger.info(f"Sample EOD data: {eod_data.head(1).to_dicts()}")
+        
+        # Convert both DataFrames to use datetime[μs] for created_at
+        if not stock_prices.is_empty():
+            stock_prices = stock_prices.with_columns(
+                pl.col("created_at").cast(pl.Datetime("us")).alias("created_at")
+            )
+        
+        if not eod_data.is_empty():
+            eod_data = eod_data.with_columns(
+                pl.col("created_at").cast(pl.Datetime("us")).alias("created_at")
+            )
+        
+        # Combine and sort
+        if not stock_prices.is_empty() and not eod_data.is_empty():
+            # Ensure both DataFrames have the same schema
+            stock_prices = stock_prices.select(required_columns)
+            eod_data = eod_data.select(required_columns)
+            
+            # Now concatenate
+            df = pl.concat([stock_prices, eod_data])
+        elif not stock_prices.is_empty():
+            df = stock_prices.select(required_columns)
+        elif not eod_data.is_empty():
+            df = eod_data.select(required_columns)
+        else:
+            logger.warning(f"No data found for {ticker}")
+            return None
+        
+        # Remove duplicates based on symbol and timestamp
+        df = df.unique(subset=["symbol", "created_at"], keep="last")
+        
+        # Sort by timestamp
+        df = df.sort("created_at")
+        
+        logger.info(f"Final combined data for {ticker}: {len(df)} rows")
+        if not df.is_empty():
+            logger.info(f"Date range: {df['created_at'].min()} to {df['created_at'].max()}")
+            logger.info(f"Price range: {df['close_price'].min()} to {df['close_price'].max()}")
         
         # Ensure we have enough data points
         if len(df) < 50:
@@ -153,10 +427,12 @@ def format_rrg_data(data_df, metadata_df, index_symbol):
         
         # Format the data - simplified structure
         formatted_data = {
-            "benchmark": index_symbol.lower(),
-            "indexdata": [],
-            "datalists": [],
-            "change_data": []
+            "data": {
+                "benchmark": index_symbol.lower(),
+                "indexdata": [],
+                "datalists": [],
+                "change_data": []
+            }
         }
         
         # Get the index data first
@@ -173,21 +449,19 @@ def format_rrg_data(data_df, metadata_df, index_symbol):
                 pl.col("created_at").last()
             ).sort("date")
             
-            # Calculate index values - limit to last 60 days
+            # Calculate index values
             index_values = []
-            seen_values = set()  # To prevent duplicates
             for row in index_data.iter_rows(named=True):
                 try:
                     price = float(row["close_price"])
-                    formatted_price = f"{price:.1f}"  # One decimal place
-                    if formatted_price not in seen_values:
-                        seen_values.add(formatted_price)
+                    if price > 0:  # Only add positive prices
+                        formatted_price = f"{price:.1f}"  # One decimal place as per example
                         index_values.append(formatted_price)
                 except (ValueError, TypeError):
                     continue
             
-            # Add index values to indexdata - limit to last 60 values
-            formatted_data["indexdata"] = index_values[-60:] if len(index_values) > 60 else index_values
+            # Add all index values to indexdata without limitation
+            formatted_data["data"]["indexdata"] = index_values
         
         # Get unique dates for change_data
         unique_dates = df.select(pl.col("created_at").dt.date().alias("date")).unique().sort("date")
@@ -205,15 +479,26 @@ def format_rrg_data(data_df, metadata_df, index_symbol):
             if len(ticker_data) > 60:
                 ticker_data = ticker_data.tail(60)
             
+            # Get metadata for this ticker
+            ticker_metadata = metadata_df.filter(pl.col("ticker") == ticker)
+            if not ticker_metadata.is_empty():
+                name = ticker_metadata["name"][0]
+                slug = ticker_metadata["slug"][0]
+                security_code = ticker_metadata["security_code"][0]
+            else:
+                name = ticker
+                slug = ticker.lower().replace(" ", "-")
+                security_code = ""
+            
             # Create datalist entry
             datalist = {
                 "code": ticker,
-                "name": ticker,
+                "name": name,
                 "meaningful_name": ticker,
-                "slug": ticker.lower().replace(" ", "-"),
+                "slug": slug,
                 "ticker": ticker,
                 "symbol": ticker,
-                "security_code": "",
+                "security_code": security_code,
                 "security_type_code": 26.0,
                 "data": []
             }
@@ -233,10 +518,13 @@ def format_rrg_data(data_df, metadata_df, index_symbol):
             for row in ticker_data.iter_rows(named=True):
                 try:
                     price = float(row["close_price"])
+                    if price <= 0:  # Skip invalid prices
+                        continue
+                        
                     date = row["created_at"].date()
                     
                     # Calculate ratio using benchmark price
-                    if date in benchmark_prices:
+                    if date in benchmark_prices and benchmark_prices[date] > 0:
                         benchmark_price = benchmark_prices[date]
                         ratio = (price / benchmark_price) * 100
                     else:
@@ -257,7 +545,10 @@ def format_rrg_data(data_df, metadata_df, index_symbol):
                     momentum.append(0.0)
                 else:
                     # Calculate momentum as percentage change over 5 periods
-                    momentum_val = ((ratios[i] - ratios[i-5]) / ratios[i-5]) * 100
+                    if ratios[i-5] != 0:
+                        momentum_val = ((ratios[i] - ratios[i-5]) / ratios[i-5]) * 100
+                    else:
+                        momentum_val = 0.0
                     momentum.append(momentum_val)
             
             # Add data points with calculated values - limit to last 60 points
@@ -268,24 +559,27 @@ def format_rrg_data(data_df, metadata_df, index_symbol):
                     
                     # Calculate additional metrics
                     prev_price = float(ticker_data["previous_close"][i]) if "previous_close" in ticker_data.columns and not ticker_data["previous_close"][i] is None else price
+                    if prev_price <= 0:  # Skip invalid previous prices
+                        continue
+                        
                     price_change = price - prev_price
                     change_percentage = (price_change / prev_price) * 100 if prev_price != 0 else 0
                     
                     # Calculate scaled momentum and other metrics
-                    scaled_momentum = momentum[i] * 2 if i < len(momentum) else 0.0
-                    scaled_price = price * 1.2  # Example scaling factor
+                    scaled_momentum = momentum[i] * 0.5 if i < len(momentum) else 0.0
+                    scaled_price = price * 0.5  # Scale factor to match example
                     
                     # Format values to match example response
                     data_point = [
                         formatted_timestamp,
-                        f"{ratios[i]:.6f}" if i < len(ratios) else "0.000000",
+                        f"{ratios[i]:.5f}" if i < len(ratios) else "0.00000",  # 5 decimal places as per example
                         f"{momentum[i]:.6f}" if i < len(momentum) else "0.000000",
                         f"{scaled_momentum:.6f}",
                         f"{price_change:.6f}",
                         f"{change_percentage:.6f}",
                         f"{scaled_price:.6f}",
                         f"{change_percentage:.6f}",
-                        str(i % 2 + 1)  # Alternate between 1 and 2
+                        "0"  # Fixed value as per example
                     ]
                     datalist["data"].append(data_point)
                     
@@ -314,20 +608,20 @@ def format_rrg_data(data_df, metadata_df, index_symbol):
                                 "momentum": f"{momentum[i]:.6f}" if i < len(momentum) else "0.000000",
                                 "ratio": f"{ratios[i]:.6f}" if i < len(ratios) else "0.000000"
                             }
-                            formatted_data["change_data"].append(change_data_point)
+                            formatted_data["data"]["change_data"].append(change_data_point)
                     
                 except Exception as e:
                     logger.error(f"Error processing data point for {ticker}: {str(e)}")
                     continue
             
             if datalist["data"]:  # Only add if we have data points
-                formatted_data["datalists"].append(datalist)
+                formatted_data["data"]["datalists"].append(datalist)
         
-        if not formatted_data["datalists"]:
+        if not formatted_data["data"]["datalists"]:
             raise ValueError("No valid data points found for any ticker")
             
         # Sort change_data by date and symbol
-        formatted_data["change_data"].sort(key=lambda x: (x["created_at"], x["symbol"]))
+        formatted_data["data"]["change_data"].sort(key=lambda x: (x["created_at"], x["symbol"]))
             
         return formatted_data
         

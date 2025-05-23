@@ -13,13 +13,6 @@ logger = logging.getLogger("clickhouse")
 # Load environment variables
 load_dotenv()
 
-
-Host = ""
-Port = 18123
-Database= ""
-User= ""
-Password= ""
-
 class ClickHousePool:
     _instance = None
 
@@ -96,11 +89,11 @@ class ClickHousePool:
             raise
 
     def get_connection_string(self):
-        user = os.getenv("DB_USER", "default")
-        pwd = os.getenv("DB_PASSWORD", "")
-        host = os.getenv("DB_HOST", "localhost")
-        port = os.getenv("DB_PORT", "18123")
-        db = os.getenv("DB_NAME", "default")
+        user = os.getenv("CHDB_USER", "default")
+        pwd = os.getenv("CHDB_PASSWORD", "")
+        host = os.getenv("CHDB_HOST", "localhost")
+        port = os.getenv("CHDB_PORT", "8123")
+        db = os.getenv("CHDB_NAME", "strike")
         return f"clickhouse://{user}:{pwd}@{host}:{port}/{db}"
 
 

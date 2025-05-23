@@ -399,7 +399,15 @@ class RRGMetadataStore:
                         FIRST_VALUE(created_at) OVER (
                             PARTITION BY symbol, DATE_TRUNC('hour', created_at)
                             ORDER BY created_at DESC
-                        ) as created_at
+                        ) as created_at,
+                        FIRST_VALUE(previous_close) OVER (
+                            PARTITION BY symbol, DATE_TRUNC('hour', created_at)
+                            ORDER BY created_at DESC
+                        ) as previous_close,
+                        FIRST_VALUE(ticker) OVER (
+                            PARTITION BY symbol, DATE_TRUNC('hour', created_at)
+                            ORDER BY created_at DESC
+                        ) as ticker
                     FROM public.stock_prices
                     WHERE created_at >= CURRENT_DATE - INTERVAL '{filter_days}' DAY
                     AND symbol IN ({','.join([f"'{s[0]}'" for s in index_symbols])})
@@ -411,7 +419,9 @@ class RRGMetadataStore:
                         created_at,
                         symbol,
                         close_price,
-                        security_code
+                        security_code,
+                        previous_close,
+                        ticker
                     FROM hourly_prices
                 ),
                 final_prices AS (
@@ -420,6 +430,8 @@ class RRGMetadataStore:
                         symbol,
                         close_price,
                         security_code,
+                        previous_close,
+                        ticker,
                         ROW_NUMBER() OVER (PARTITION BY symbol, DATE_TRUNC('hour', created_at) ORDER BY created_at DESC) as rn
                     FROM unique_prices
                 )
@@ -427,7 +439,9 @@ class RRGMetadataStore:
                     created_at,
                     symbol,
                     close_price,
-                    security_code
+                    security_code,
+                    previous_close,
+                    ticker
                 FROM final_prices
                 WHERE rn = 1
                 ORDER BY created_at DESC, symbol
@@ -450,7 +464,15 @@ class RRGMetadataStore:
                         FIRST_VALUE(created_at) OVER (
                             PARTITION BY symbol, DATE_TRUNC('day', created_at)
                             ORDER BY created_at DESC
-                        ) as created_at
+                        ) as created_at,
+                        FIRST_VALUE(previous_close) OVER (
+                            PARTITION BY symbol, DATE_TRUNC('day', created_at)
+                            ORDER BY created_at DESC
+                        ) as previous_close,
+                        FIRST_VALUE(ticker) OVER (
+                            PARTITION BY symbol, DATE_TRUNC('day', created_at)
+                            ORDER BY created_at DESC
+                        ) as ticker
                     FROM public.eod_stock_data
                     WHERE created_at >= CURRENT_DATE - INTERVAL '{filter_days}' DAY
                     AND symbol IN ({','.join([f"'{s[0]}'" for s in index_symbols])})
@@ -462,7 +484,9 @@ class RRGMetadataStore:
                         created_at,
                         symbol,
                         close_price,
-                        security_code
+                        security_code,
+                        previous_close,
+                        ticker
                     FROM daily_prices
                 ),
                 final_prices AS (
@@ -471,6 +495,8 @@ class RRGMetadataStore:
                         symbol,
                         close_price,
                         security_code,
+                        previous_close,
+                        ticker,
                         ROW_NUMBER() OVER (PARTITION BY symbol, DATE_TRUNC('day', created_at) ORDER BY created_at DESC) as rn
                     FROM unique_prices
                 )
@@ -478,7 +504,9 @@ class RRGMetadataStore:
                     created_at,
                     symbol,
                     close_price,
-                    security_code
+                    security_code,
+                    previous_close,
+                    ticker
                 FROM final_prices
                 WHERE rn = 1
                 ORDER BY created_at DESC, symbol
@@ -489,8 +517,8 @@ class RRGMetadataStore:
                 eod_stock_data = dd_con.execute(eod_stock_query).fetchall()
                 
                 # Convert to DataFrames
-                df1 = pl.DataFrame(stock_prices, schema=["created_at", "symbol", "close_price", "security_code"])
-                df2 = pl.DataFrame(eod_stock_data, schema=["created_at", "symbol", "close_price", "security_code"])
+                df1 = pl.DataFrame(stock_prices, schema=["created_at", "symbol", "close_price", "security_code", "previous_close", "ticker"])
+                df2 = pl.DataFrame(eod_stock_data, schema=["created_at", "symbol", "close_price", "security_code", "previous_close", "ticker"])
                 
                 # Combine and sort
                 df = pl.concat([df1, df2])
@@ -515,7 +543,7 @@ class RRGMetadataStore:
                     raise ValueError("No price data found")
                 
                 # Check for required columns
-                required_columns = ["created_at", "symbol", "close_price", "security_code", "name", "slug", "security_type_code", "ticker"]
+                required_columns = ["created_at", "symbol", "close_price", "security_code", "name", "slug", "security_type_code", "ticker", "previous_close"]
                 for col in required_columns:
                     if col not in df.columns:
                         raise ValueError(f"Missing required column: {col}")
@@ -526,6 +554,7 @@ class RRGMetadataStore:
                 # Format the data but keep datetime as datetime
                 df = df.with_columns([
                     pl.col("close_price").round(2).cast(pl.Utf8),
+                    pl.col("previous_close").round(2).cast(pl.Utf8),
                     pl.col("security_type_code").cast(pl.Utf8)
                 ])
                 

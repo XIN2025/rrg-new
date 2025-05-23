@@ -41,3 +41,5 @@ def return_filter_days(timeframe):
                 days = 30
         logging.debug(f"Calculated {days} filter days for {timeframe}")
         return days 
+
+
