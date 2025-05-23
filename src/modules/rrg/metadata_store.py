@@ -13,6 +13,7 @@ from src.utils.duck_pool import get_duckdb_connection
 from src.modules.rrg.time_utils import return_filter_days
 import time as t
 import logging
+from typing import List, Optional
 
 INDIAN_TZ = "Asia/Kolkata"
 
@@ -65,164 +66,96 @@ class RRGMetadataStore:
         self._price_data_loaded = False
         self._last_price_refresh_time = None
         self._price_data_days = 3650  # Increased to 10 years to ensure complete historical data
+        self._price_data = {}
         self.ensure_metadata_loaded()
 
     def _load_metadata(self):
-        """
-        Internal function to load all metadata from DuckDB.
-        This is called by ensure_metadata_loaded and refresh_metadata.
-        """
-        conn = get_duckdb_connection()
-        
+        """Internal function to load metadata from DuckDB."""
         try:
-            with DuckDBQueryTimer("indices_query"):
-                self._indices_df = conn.sql("SELECT security_code, name, slug, symbol FROM public.indices").pl()
-            
-            with DuckDBQueryTimer("indices_stocks_query"):
-                self._indices_stocks_df = conn.sql("SELECT security_code FROM public.indices_stocks").pl()
-            
-            with DuckDBQueryTimer("companies_query"):
-                self._companies_df = conn.sql("SELECT slug, name FROM public.companies").pl()
-            
-            with DuckDBQueryTimer("stocks_query"):
-                self._stocks_df = conn.sql("SELECT company_name, security_code FROM public.stocks").pl()
-            
-            with DuckDBQueryTimer("market_metadata_query"):
-                self._market_metadata_df = conn.sql("SELECT symbol, name, slug, ticker, security_code, security_type_code FROM public.market_metadata").pl()
-            
-            return True
+            with get_duckdb_connection() as conn:
+                # Query market_metadata table with correct schema and columns
+                self._indices_df = conn.sql("""
+                    SELECT 
+                        security_code, 
+                        company_name as name, 
+                        symbol,
+                        ticker,
+                        slug
+                    FROM public.market_metadata 
+                    WHERE security_type_code = 5
+                """).pl()
+                
+                self._stocks_df = conn.sql("""
+                    SELECT 
+                        security_code, 
+                        company_name as name, 
+                        symbol,
+                        ticker,
+                        slug
+                    FROM public.market_metadata 
+                    WHERE security_type_code = 26
+                """).pl()
+                
+                # Load full market metadata
+                self._market_metadata_df = conn.sql("""
+                    SELECT 
+                        security_code,
+                        company_name as name,
+                        symbol,
+                        ticker,
+                        security_type_code,
+                        slug
+                    FROM public.market_metadata
+                """).pl()
+                
+                return True
         except Exception as e:
             logger.error(f"[RRG Metadata] Error loading metadata: {str(e)}", exc_info=True)
             return False
 
     def _load_price_data(self, days=None):
-        """
-        Internal function to load stock price and EOD data from DuckDB.
-        
-        Args:
-            days: Number of days of historical data to load (defaults to _price_data_days)
-        """
-        if days is not None:
-            self._price_data_days = days
-        
-        conn = get_duckdb_connection()
-        
+        """Internal function to load price data from DuckDB."""
         try:
-            load_start = t.time()
+            if days is not None:
+                self._price_data_days = days
             
-            # First get the list of index symbols from market_metadata
-            index_symbols = conn.sql(
-                """SELECT DISTINCT symbol 
-                   FROM public.market_metadata 
-                   WHERE security_type_code IN (5, 26)"""
-            ).pl()["symbol"].to_list()
-            
-            if not index_symbols:
-                raise ValueError("No index symbols found in market_metadata")
-            
-            # Load index data first
-            with DuckDBQueryTimer("index_prices_query"):
-                self._stock_prices_df = conn.sql(
-                    f"""SELECT 
-                        created_at,
-                        symbol,
-                        current_price as close_price,
-                        security_code,
-                        previous_close,
-                        ticker
-                    FROM public.stock_prices
-                    WHERE created_at >= CURRENT_DATE - INTERVAL '{self._price_data_days} days'
-                    AND symbol IN ({','.join([f"'{s}'" for s in index_symbols])})
-                    AND current_price > 0  -- Ensure positive prices
-                    ORDER BY created_at ASC"""
-                ).pl()
-            
-            # Load EOD data for indices
-            with DuckDBQueryTimer("eod_index_data_query"):
-                self._eod_stock_data_df = conn.sql(
-                    f"""SELECT 
-                        created_at,
-                        symbol,
-                        close_price,
-                        security_code,
-                        previous_close,
-                        ticker
-                    FROM public.eod_stock_data 
-                    WHERE created_at >= CURRENT_DATE - INTERVAL '{self._price_data_days} days'
-                    AND symbol IN ({','.join([f"'{s}'" for s in index_symbols])})
-                    AND close_price > 0  -- Ensure positive prices
-                    ORDER BY created_at ASC"""
-                ).pl()
-            
-            # Join with market_metadata to get additional fields
-            self._stock_prices_df = self._stock_prices_df.join(
-                conn.sql("SELECT symbol, name, slug, security_type_code FROM public.market_metadata").pl(),
-                on="symbol",
-                how="left"
-            )
-            
-            self._eod_stock_data_df = self._eod_stock_data_df.join(
-                conn.sql("SELECT symbol, name, slug, security_type_code FROM public.market_metadata").pl(),
-                on="symbol",
-                how="left"
-            )
-            
-            # Handle timezone conversions
-            self._stock_prices_df = self._stock_prices_df.with_columns(
-                pl.col("created_at").dt.replace_time_zone("UTC").dt.convert_time_zone("Asia/Kolkata").alias("created_at")
-            )
-            self._eod_stock_data_df = self._eod_stock_data_df.with_columns(
-                pl.col("created_at").dt.replace_time_zone("UTC").dt.convert_time_zone(INDIAN_TZ).alias("created_at")
-            )
-            
-            # Remove timezone info from stock prices
-            self._stock_prices_df = self._stock_prices_df.with_columns(
-                pl.col("created_at").dt.replace_time_zone(None).alias("created_at")
-            )
-            
-            # Process EOD data dates
-            self._eod_stock_data_df = self._eod_stock_data_df.with_columns(
-                pl.col("created_at").dt.replace_time_zone("UTC").dt.convert_time_zone(INDIAN_TZ)
-            )
-            self._eod_stock_data_df = self._eod_stock_data_df.with_columns(
-                pl.col("created_at").dt.date().cast(pl.Datetime).alias("created_at")
-            )
-            
-            # Add one day to EOD dates
-            self._eod_stock_data_df = self._eod_stock_data_df.with_columns(
-                (pl.col("created_at") + pl.duration(days=1)).alias("created_at")
-            )
-            
-            # Format slugs properly
-            for df in [self._stock_prices_df, self._eod_stock_data_df]:
-                if "slug" in df.columns:
-                    df = df.with_columns([
-                        pl.col("slug").str.replace(" ", "").str.replace("-", "").str.replace("&", "").str.to_lowercase().alias("slug")
-                    ])
-            
-            # Validate data
-            # Check for required columns
-            required_columns = ["created_at", "symbol", "close_price", "security_code", "ticker", "name", "slug", "security_type_code"]
-            for df_name, df in [("stock_prices", self._stock_prices_df), ("eod_stock_data", self._eod_stock_data_df)]:
-                missing_columns = [col for col in required_columns if col not in df.columns]
-                if missing_columns:
-                    raise ValueError(f"Missing required columns in {df_name}: {missing_columns}")
-            
-            # Check for valid security type codes
-            for df_name, df in [("stock_prices", self._stock_prices_df), ("eod_stock_data", self._eod_stock_data_df)]:
-                invalid_types = df.filter(~pl.col("security_type_code").is_in([5, 26]))["symbol"].unique()
-                if len(invalid_types) > 0:
-                    raise ValueError(f"Invalid security type codes in {df_name} for symbols: {invalid_types}")
-            
-            # Check for valid prices
-            for df_name, df in [("stock_prices", self._stock_prices_df), ("eod_stock_data", self._eod_stock_data_df)]:
-                invalid_prices = df.filter(pl.col("close_price") <= 0)
-                if len(invalid_prices) > 0:
-                    raise ValueError(f"Found non-positive prices in {df_name}")
-            
-            return True
+            with get_duckdb_connection() as conn:
+                if not conn:
+                    raise Exception("Failed to establish DuckDB connection")
+
+                # Load index data
+                index_query = f"""
+                SELECT 
+                    timestamp as created_at,
+                    symbol,
+                    close_price,
+                    security_code,
+                    ticker
+                FROM public.hourly_stock_data
+                WHERE timestamp >= CURRENT_DATE - INTERVAL '{self._price_data_days} days'
+                AND close_price > 0
+                ORDER BY timestamp ASC
+                """
+                
+                # Load stock data
+                stock_query = f"""
+                SELECT 
+                    timestamp as created_at,
+                    symbol,
+                    close_price,
+                    security_code,
+                    ticker
+                FROM public.hourly_stock_data
+                WHERE timestamp >= CURRENT_DATE - INTERVAL '{self._price_data_days} days'
+                AND close_price > 0
+                ORDER BY timestamp ASC
+                """
+                
+                self._stock_prices_df = conn.execute(stock_query).fetchdf()
+                self._eod_stock_data_df = conn.execute(index_query).fetchdf()
+                return True
         except Exception as e:
-            logger.error(f"[RRG Price Data] Error loading price data: {str(e)}", exc_info=True)
+            logger.error(f"[RRG Price Data] Error loading price data: {str(e)}")
             return False
 
     def ensure_metadata_loaded(self):
@@ -343,18 +276,16 @@ class RRGMetadataStore:
         self.ensure_metadata_loaded()
         return self._stocks_df.clone()
 
-    def get_market_metadata(self, symbols=None):
+    def get_market_metadata(self, symbols: List[str]) -> Optional[pl.DataFrame]:
         """
-        Get market metadata for specified symbols.
+        Get market metadata for given symbols.
         If symbols is None, returns all metadata.
         """
         try:
-            if symbols is None:
-                return self._market_metadata_df.clone()
-            
-            # Convert symbols to list if it's a single string
-            if isinstance(symbols, str):
-                symbols = [symbols]
+            if self._market_metadata_df is None:
+                self.ensure_metadata_loaded()
+                if self._market_metadata_df is None:
+                    return None
             
             # Filter metadata for specified symbols
             return self._market_metadata_df.filter(pl.col("symbol").is_in(symbols)).clone()
@@ -386,95 +317,26 @@ class RRGMetadataStore:
                 stock_price_query = f"""
                 WITH hourly_prices AS (
                     SELECT 
-                        DATE_TRUNC('hour', created_at) as hour,
-                        symbol,
-                        FIRST_VALUE(current_price) OVER (
-                            PARTITION BY symbol, DATE_TRUNC('hour', created_at)
-                            ORDER BY created_at DESC
-                        ) as close_price,
-                        FIRST_VALUE(security_code) OVER (
-                            PARTITION BY symbol, DATE_TRUNC('hour', created_at)
-                            ORDER BY created_at DESC
-                        ) as security_code,
-                        FIRST_VALUE(created_at) OVER (
-                            PARTITION BY symbol, DATE_TRUNC('hour', created_at)
-                            ORDER BY created_at DESC
-                        ) as created_at,
-                        FIRST_VALUE(previous_close) OVER (
-                            PARTITION BY symbol, DATE_TRUNC('hour', created_at)
-                            ORDER BY created_at DESC
-                        ) as previous_close,
-                        FIRST_VALUE(ticker) OVER (
-                            PARTITION BY symbol, DATE_TRUNC('hour', created_at)
-                            ORDER BY created_at DESC
-                        ) as ticker
-                    FROM public.stock_prices
-                    WHERE created_at >= CURRENT_DATE - INTERVAL '{filter_days}' DAY
-                    AND symbol IN ({','.join([f"'{s[0]}'" for s in index_symbols])})
-                    AND current_price > 0
-                    AND current_price < 1000000
-                ),
-                unique_prices AS (
-                    SELECT DISTINCT
-                        created_at,
-                        symbol,
-                        close_price,
-                        security_code,
-                        previous_close,
-                        ticker
-                    FROM hourly_prices
-                ),
-                final_prices AS (
-                    SELECT 
-                        created_at,
-                        symbol,
-                        close_price,
-                        security_code,
-                        previous_close,
-                        ticker,
-                        ROW_NUMBER() OVER (PARTITION BY symbol, DATE_TRUNC('hour', created_at) ORDER BY created_at DESC) as rn
-                    FROM unique_prices
-                )
-                SELECT 
-                    created_at,
-                    symbol,
-                    close_price,
-                    security_code,
-                    previous_close,
-                    ticker
-                FROM final_prices
-                WHERE rn = 1
-                ORDER BY created_at DESC, symbol
-                """
-                
-                # Query for EOD stock data with proper deduplication
-                eod_stock_query = f"""
-                WITH daily_prices AS (
-                    SELECT 
-                        DATE_TRUNC('day', created_at) as day,
+                        DATE_TRUNC('hour', timestamp) as hour,
                         symbol,
                         FIRST_VALUE(close_price) OVER (
-                            PARTITION BY symbol, DATE_TRUNC('day', created_at)
-                            ORDER BY created_at DESC
+                            PARTITION BY symbol, DATE_TRUNC('hour', timestamp)
+                            ORDER BY timestamp DESC
                         ) as close_price,
                         FIRST_VALUE(security_code) OVER (
-                            PARTITION BY symbol, DATE_TRUNC('day', created_at)
-                            ORDER BY created_at DESC
+                            PARTITION BY symbol, DATE_TRUNC('hour', timestamp)
+                            ORDER BY timestamp DESC
                         ) as security_code,
-                        FIRST_VALUE(created_at) OVER (
-                            PARTITION BY symbol, DATE_TRUNC('day', created_at)
-                            ORDER BY created_at DESC
+                        FIRST_VALUE(timestamp) OVER (
+                            PARTITION BY symbol, DATE_TRUNC('hour', timestamp)
+                            ORDER BY timestamp DESC
                         ) as created_at,
-                        FIRST_VALUE(previous_close) OVER (
-                            PARTITION BY symbol, DATE_TRUNC('day', created_at)
-                            ORDER BY created_at DESC
-                        ) as previous_close,
                         FIRST_VALUE(ticker) OVER (
-                            PARTITION BY symbol, DATE_TRUNC('day', created_at)
-                            ORDER BY created_at DESC
+                            PARTITION BY symbol, DATE_TRUNC('hour', timestamp)
+                            ORDER BY timestamp DESC
                         ) as ticker
-                    FROM public.eod_stock_data
-                    WHERE created_at >= CURRENT_DATE - INTERVAL '{filter_days}' DAY
+                    FROM public.hourly_stock_data
+                    WHERE timestamp >= CURRENT_DATE - INTERVAL '{filter_days}' DAY
                     AND symbol IN ({','.join([f"'{s[0]}'" for s in index_symbols])})
                     AND close_price > 0
                     AND close_price < 1000000
@@ -485,7 +347,64 @@ class RRGMetadataStore:
                         symbol,
                         close_price,
                         security_code,
-                        previous_close,
+                        ticker
+                    FROM hourly_prices
+                ),
+                final_prices AS (
+                    SELECT 
+                        created_at,
+                        symbol,
+                        close_price,
+                        security_code,
+                        ticker,
+                        ROW_NUMBER() OVER (PARTITION BY symbol, DATE_TRUNC('hour', created_at) ORDER BY created_at DESC) as rn
+                    FROM unique_prices
+                )
+                SELECT 
+                    created_at,
+                    symbol,
+                    close_price,
+                    security_code,
+                    ticker
+                FROM final_prices
+                WHERE rn = 1
+                ORDER BY created_at DESC, symbol
+                """
+                
+                # Query for EOD stock data with proper deduplication
+                eod_stock_query = f"""
+                WITH daily_prices AS (
+                    SELECT 
+                        DATE_TRUNC('day', timestamp) as day,
+                        symbol,
+                        FIRST_VALUE(close_price) OVER (
+                            PARTITION BY symbol, DATE_TRUNC('day', timestamp)
+                            ORDER BY timestamp DESC
+                        ) as close_price,
+                        FIRST_VALUE(security_code) OVER (
+                            PARTITION BY symbol, DATE_TRUNC('day', timestamp)
+                            ORDER BY timestamp DESC
+                        ) as security_code,
+                        FIRST_VALUE(timestamp) OVER (
+                            PARTITION BY symbol, DATE_TRUNC('day', timestamp)
+                            ORDER BY timestamp DESC
+                        ) as created_at,
+                        FIRST_VALUE(ticker) OVER (
+                            PARTITION BY symbol, DATE_TRUNC('day', timestamp)
+                            ORDER BY timestamp DESC
+                        ) as ticker
+                    FROM public.hourly_stock_data
+                    WHERE timestamp >= CURRENT_DATE - INTERVAL '{filter_days}' DAY
+                    AND symbol IN ({','.join([f"'{s[0]}'" for s in index_symbols])})
+                    AND close_price > 0
+                    AND close_price < 1000000
+                ),
+                unique_prices AS (
+                    SELECT DISTINCT
+                        created_at,
+                        symbol,
+                        close_price,
+                        security_code,
                         ticker
                     FROM daily_prices
                 ),
@@ -495,7 +414,6 @@ class RRGMetadataStore:
                         symbol,
                         close_price,
                         security_code,
-                        previous_close,
                         ticker,
                         ROW_NUMBER() OVER (PARTITION BY symbol, DATE_TRUNC('day', created_at) ORDER BY created_at DESC) as rn
                     FROM unique_prices
@@ -505,7 +423,6 @@ class RRGMetadataStore:
                     symbol,
                     close_price,
                     security_code,
-                    previous_close,
                     ticker
                 FROM final_prices
                 WHERE rn = 1
@@ -517,8 +434,8 @@ class RRGMetadataStore:
                 eod_stock_data = dd_con.execute(eod_stock_query).fetchall()
                 
                 # Convert to DataFrames
-                df1 = pl.DataFrame(stock_prices, schema=["created_at", "symbol", "close_price", "security_code", "previous_close", "ticker"])
-                df2 = pl.DataFrame(eod_stock_data, schema=["created_at", "symbol", "close_price", "security_code", "previous_close", "ticker"])
+                df1 = pl.DataFrame(stock_prices, schema=["created_at", "symbol", "close_price", "security_code", "ticker"])
+                df2 = pl.DataFrame(eod_stock_data, schema=["created_at", "symbol", "close_price", "security_code", "ticker"])
                 
                 # Combine and sort
                 df = pl.concat([df1, df2])
@@ -543,25 +460,15 @@ class RRGMetadataStore:
                     raise ValueError("No price data found")
                 
                 # Check for required columns
-                required_columns = ["created_at", "symbol", "close_price", "security_code", "name", "slug", "security_type_code", "ticker", "previous_close"]
+                required_columns = ["created_at", "symbol", "close_price", "security_code", "name", "slug", "security_type_code", "ticker"]
                 for col in required_columns:
                     if col not in df.columns:
                         raise ValueError(f"Missing required column: {col}")
                 
-                # Filter out rows with null values
-                df = df.filter(pl.col("close_price").is_not_null())
-                
-                # Format the data but keep datetime as datetime
-                df = df.with_columns([
-                    pl.col("close_price").round(2).cast(pl.Utf8),
-                    pl.col("previous_close").round(2).cast(pl.Utf8),
-                    pl.col("security_type_code").cast(pl.Utf8)
-                ])
-                
                 return df
                 
             except Exception as e:
-                logger.error(f"[RRG Price Data] Error loading price data: {str(e)}", exc_info=True)
+                logger.error(f"Error getting stock prices: {str(e)}", exc_info=True)
                 raise
 
     def get_eod_stock_data(self, tickers=None, symbols=None, filter_days=None):
@@ -587,3 +494,47 @@ class RRGMetadataStore:
             df = df.filter(pl.col("created_at") >= cutoff_date)
         
         return df.clone()
+
+    def test_metadata_loading(self):
+        """Test method to verify metadata loading functionality"""
+        try:
+            # Force refresh metadata
+            self.refresh_metadata()
+            
+            # Verify indices data
+            indices_df = self.get_indices()
+            if indices_df is None or indices_df.is_empty():
+                logger.error("Failed to load indices data")
+                return False
+            logger.info(f"Successfully loaded {len(indices_df)} indices")
+            
+            # Verify stocks data
+            stocks_df = self.get_stocks()
+            if stocks_df is None or stocks_df.is_empty():
+                logger.error("Failed to load stocks data")
+                return False
+            logger.info(f"Successfully loaded {len(stocks_df)} stocks")
+            
+            # Verify market metadata
+            with get_duckdb_connection() as conn:
+                metadata_count = conn.execute("SELECT COUNT(*) FROM public.market_metadata").fetchone()[0]
+                logger.info(f"Market metadata table has {metadata_count} records")
+                
+                # Verify security type codes
+                type_counts = conn.execute("""
+                    SELECT security_type_code, COUNT(*) 
+                    FROM public.market_metadata 
+                    GROUP BY security_type_code
+                """).fetchall()
+                logger.info("Security type code distribution:")
+                for type_code, count in type_counts:
+                    logger.info(f"Type {type_code}: {count} records")
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error testing metadata loading: {str(e)}", exc_info=True)
+            return False
+
+
+
+# 

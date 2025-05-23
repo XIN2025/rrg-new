@@ -10,6 +10,7 @@ from src.utils.logger import get_logger
 from src.modules.rrg.metadata_store import get_metadata_status, refresh_metadata
 import time
 import logging
+from src.modules.rrg.service import load_hourly_data
 
 # Configure logger to only show errors
 logger = get_logger("rrg_router")
@@ -128,7 +129,7 @@ async def load_eod_data(
 
 # Fetches intraday/hourly price history (indiacharts.stock_prices from PG for last 6 months) -> public.stock_prices (DuckDB)
 @router.get("/load_hourly_data", response_model=StatusResponse)
-async def load_hourly_data(
+async def load_hourly_data_endpoint(
     current_user: str = Depends(get_current_user)
 ):
     with TimerMetric("load_hourly_data_endpoint", "rrg_router"):
@@ -146,7 +147,27 @@ async def load_hourly_data(
             raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/hourly-data")
+async def update_hourly_data():
+    """Update hourly stock data"""
+    with TimerMetric("update_hourly_data_endpoint", "rrg_router"):
+        start_time = time.time()
+        logger.info("Hourly data update requested")
 
+        try:
+            success = await service.load_hourly_data()
+            elapsed_time = time.time() - start_time
+            
+            if success:
+                logger.info(f"Hourly data updated successfully in {elapsed_time:.2f}s")
+                return {"status": "Updated hourly stock data"}
+            else:
+                raise HTTPException(status_code=500, detail="Failed to update hourly stock data")
+                
+        except Exception as e:
+            record_rrg_error("hourly_data_update")
+            logger.error(f"Error updating hourly data: {str(e)}")
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 # generate_csv function

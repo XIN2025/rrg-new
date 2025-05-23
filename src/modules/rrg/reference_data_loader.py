@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from src.utils.metrics import TimerMetric, DuckDBQueryTimer
 from src.utils.logger import get_logger
 from src.utils.duck_pool import get_duckdb_connection
+from src.utils.clickhouse import get_clickhouse_connection
 import time as t
 import logging
 
@@ -21,21 +22,20 @@ class RRGReferenceDataLoader:
         """
         Internal function to load market metadata from DuckDB.
         """
-        conn = get_duckdb_connection()
-        
         try:
-            with DuckDBQueryTimer("market_metadata_query"):
-                self._market_metadata_df = conn.sql(
-                    """SELECT 
-                        symbol, 
-                        name, 
-                        slug, 
-                        ticker, 
-                        security_code, 
-                        security_type_code 
-                    FROM public.market_metadata 
-                    WHERE security_type_code IN (5, 26)"""
-                ).pl()
+            with get_duckdb_connection() as conn:
+                with DuckDBQueryTimer("market_metadata_query"):
+                    self._market_metadata_df = conn.sql(
+                        """SELECT 
+                            symbol, 
+                            name, 
+                            slug, 
+                            ticker, 
+                            security_code, 
+                            security_type_code 
+                        FROM public.market_metadata 
+                        WHERE security_type_code IN (5, 26)"""
+                    ).pl()
             
             return True
         except Exception as e:
@@ -84,192 +84,190 @@ class RRGReferenceDataLoader:
             "last_refresh": self._last_refresh_time.isoformat() if self._last_refresh_time else None
         }
 
+def fetch_and_log_columns(ch_client):
+    """Fetch and log the column names for strike.mv_indices and strike.mv_stocks."""
+    try:
+        indices_columns = ch_client.query("SELECT * FROM strike.mv_indices LIMIT 0").column_names
+        stocks_columns = ch_client.query("SELECT * FROM strike.mv_stocks LIMIT 0").column_names
+        logger.info("Columns in strike.mv_indices:")
+        for col in indices_columns:
+            logger.info(f"  {col}")
+        logger.info("Columns in strike.mv_stocks:")
+        for col in stocks_columns:
+            logger.info(f"  {col}")
+    except Exception as e:
+        logger.error(f"Error fetching column names: {str(e)}", exc_info=True)
+
 def load_market_metadata(dd_con=None, force=False):
     """Load market metadata from ClickHouse into DuckDB."""
-    try:
-        # Create necessary tables if they don't exist
+    with get_duckdb_connection() as dd_con:
+        # Drop and create table to ensure schema matches
+        dd_con.execute("DROP TABLE IF EXISTS public.market_metadata;")
         dd_con.execute("""
-            CREATE TABLE IF NOT EXISTS public.market_metadata (
+            CREATE TABLE public.market_metadata (
+                security_token VARCHAR,
                 security_code VARCHAR,
-                symbol VARCHAR,
-                ticker VARCHAR,
-                name VARCHAR,
-                slug VARCHAR,
-                security_type_code VARCHAR,
-                index_name VARCHAR,
-                indices_slug VARCHAR,
                 company_name VARCHAR,
-                company_slug VARCHAR,
-                sector VARCHAR,
-                industry VARCHAR,
-                market_cap DECIMAL,
-                is_active BOOLEAN,
-                created_at TIMESTAMP,
-                updated_at TIMESTAMP,
-                description VARCHAR,
-                exchange VARCHAR,
-                currency VARCHAR,
-                country VARCHAR
-            )
-        """)
-
-        dd_con.execute("""
-            CREATE TABLE IF NOT EXISTS public.stock_prices (
-                created_at TIMESTAMP,
                 symbol VARCHAR,
-                current_price DECIMAL,
-                security_code VARCHAR,
-                previous_close DECIMAL,
-                ticker VARCHAR
+                alternate_symbol VARCHAR,
+                ticker VARCHAR,
+                is_fno BOOLEAN,
+                stocks_count INTEGER,
+                stocks VARCHAR,
+                security_codes VARCHAR,
+                security_tokens VARCHAR,
+                series VARCHAR,
+                category VARCHAR,
+                exchange_group VARCHAR,
+                security_type_code INTEGER
             )
         """)
 
+        with get_clickhouse_connection() as ch_client:
+            # Fetch indices metadata
+            indices_query = """
+            SELECT 
+                security_token,
+                security_code,
+                company_name,
+                symbol,
+                alternate_symbol,
+                ticker,
+                is_fno,
+                stocks_count,
+                stocks,
+                security_codes,
+                security_tokens,
+                NULL as series,
+                NULL as category,
+                NULL as exchange_group,
+                5 as security_type_code
+            FROM strike.mv_indices
+            """
+            logger.info("Executing indices metadata query...")
+            indices_result = ch_client.query(indices_query).result_rows
+            logger.info(f"Fetched {len(indices_result)} indices records")
+
+            # Fetch stocks metadata
+            stocks_query = """
+            SELECT 
+                security_token,
+                security_code,
+                company_name,
+                symbol,
+                alternate_symbol,
+                ticker,
+                is_fno,
+                NULL as stocks_count,
+                NULL as stocks,
+                NULL as security_codes,
+                NULL as security_tokens,
+                series,
+                category,
+                exchange_group,
+                26 as security_type_code
+            FROM strike.mv_stocks
+            """
+            logger.info("Executing stocks metadata query...")
+            stocks_result = ch_client.query(stocks_query).result_rows
+            logger.info(f"Fetched {len(stocks_result)} stocks records")
+
+            # Combine results
+            all_metadata = indices_result + stocks_result
+            logger.info(f"Total records to insert: {len(all_metadata)}")
+
+            if all_metadata:
+                # Convert to DataFrame
+                df = pl.DataFrame(all_metadata, schema=[
+                    "security_token", "security_code", "company_name", "symbol", "alternate_symbol",
+                    "ticker", "is_fno", "stocks_count", "stocks", "security_codes", "security_tokens",
+                    "series", "category", "exchange_group", "security_type_code"
+                ])
+
+                # Insert into DuckDB
+                dd_con.execute("BEGIN TRANSACTION")
+                try:
+                    dd_con.execute("INSERT INTO public.market_metadata SELECT * FROM df")
+                    dd_con.execute("COMMIT")
+                    logger.info("Successfully loaded market metadata into DuckDB")
+                    return True
+                except Exception as e:
+                    dd_con.execute("ROLLBACK")
+                    logger.error(f"Error loading market metadata: {str(e)}")
+                    return False
+            else:
+                logger.warning("No market metadata records found to insert")
+                return False
+
+def load_stock_prices(dd_con=None, force=False):
+    """Load stock prices from ClickHouse into DuckDB."""
+    with get_duckdb_connection() as dd_con:
+        # Drop and create table to ensure schema matches
+        dd_con.execute("DROP TABLE IF EXISTS public.stock_prices;")
         dd_con.execute("""
-            CREATE TABLE IF NOT EXISTS public.eod_stock_data (
-                created_at TIMESTAMP,
+            CREATE TABLE public.stock_prices (
                 symbol VARCHAR,
-                close_price DECIMAL,
-                security_code VARCHAR,
-                previous_close DECIMAL,
-                ticker VARCHAR
+                created_at TIMESTAMP,
+                current_price DOUBLE,
+                previous_close DOUBLE,
+                security_code VARCHAR
             )
         """)
 
-        # Log table creation
-        logger.info("Created/verified tables in DuckDB:")
-        tables = dd_con.execute("SHOW TABLES").fetchall()
-        for table in tables:
-            logger.info(f"Table: {table[0]}")
-            # Show table schema
-            schema = dd_con.execute(f"DESCRIBE {table[0]}").fetchall()
-            logger.info(f"Schema for {table[0]}:")
-            for col in schema:
-                logger.info(f"  {col[0]}: {col[1]}")
+        with get_clickhouse_connection() as ch_client:
+            # Fetch current stock prices (1min)
+            current_prices_query = """
+            SELECT 
+                symbol,
+                date_time as created_at,
+                ltp as current_price,
+                close as previous_close,
+                security_code
+            FROM strike.equity_prices_1min_last_traded
+            WHERE ltp > 0
+            """
+            logger.info("Executing current stock prices query...")
+            current_prices_result = ch_client.query(current_prices_query).result_rows
+            logger.info(f"Fetched {len(current_prices_result)} current price records")
 
-        # Check if data already exists
-        if not force:
-            result = dd_con.execute("SELECT COUNT(*) FROM public.market_metadata").fetchone()
-            if result[0] > 0:
-                logger.info("Market metadata already exists, skipping load")
-                return
+            # Fetch historical stock prices (1d)
+            historical_prices_query = """
+            SELECT 
+                security_code,
+                date_time as created_at,
+                close as current_price,
+                close as previous_close,
+                NULL as symbol
+            FROM strike.equity_prices_1d
+            WHERE close > 0
+            """
+            logger.info("Executing historical stock prices query...")
+            historical_prices_result = ch_client.query(historical_prices_query).result_rows
+            logger.info(f"Fetched {len(historical_prices_result)} historical price records")
 
-        # Query for indices metadata
-        metadata_query = """
-        SELECT 
-            mi.security_code,
-            mi.symbol,
-            mi.ticker,
-            mi.name,
-            mi.slug,
-            mi.security_type_code,
-            mi.index_name,
-            mi.indices_slug,
-            mi.company_name,
-            mi.company_slug,
-            mi.sector,
-            mi.industry,
-            mi.market_cap,
-            mi.is_active,
-            mi.created_at,
-            mi.updated_at,
-            mi.description,
-            mi.exchange,
-            mi.currency,
-            mi.country
-        FROM strike.mv_indices mi
-        WHERE mi.is_active = 1
-        AND mi.symbol IS NOT NULL
-        AND mi.symbol != ''
-        AND mi.security_type_code IN ('5', '26')
-        """
+            # Combine results
+            all_prices = current_prices_result + historical_prices_result
+            logger.info(f"Total price records to insert: {len(all_prices)}")
 
-        # Query for stocks metadata
-        metadata_query2 = """
-        SELECT 
-            ms.security_code,
-            ms.symbol,
-            ms.ticker,
-            ms.name,
-            ms.slug,
-            ms.security_type_code,
-            ms.index_name,
-            ms.indices_slug,
-            ms.company_name,
-            ms.company_slug,
-            ms.sector,
-            ms.industry,
-            ms.market_cap,
-            ms.is_active,
-            ms.created_at,
-            ms.updated_at,
-            ms.description,
-            ms.exchange,
-            ms.currency,
-            ms.country
-        FROM strike.mv_stocks ms
-        WHERE ms.is_active = 1
-        AND ms.symbol IS NOT NULL
-        AND ms.symbol != ''
-        AND ms.security_type_code IN ('5', '26')
-        """
+            if all_prices:
+                # Convert to DataFrame
+                df = pl.DataFrame(all_prices, schema=[
+                    "symbol", "created_at", "current_price", "previous_close", "security_code"
+                ])
 
-        # Execute queries
-        indices_result = ClickHousePool.execute_query(metadata_query)
-        stocks_result = ClickHousePool.execute_query(metadata_query2)
+                # Insert into DuckDB
+                dd_con.execute("BEGIN TRANSACTION")
+                try:
+                    dd_con.execute("INSERT INTO public.stock_prices SELECT * FROM df")
+                    dd_con.execute("COMMIT")
+                    logger.info("Successfully loaded stock prices into DuckDB")
+                    return True
+                except Exception as e:
+                    dd_con.execute("ROLLBACK")
+                    logger.error(f"Error loading stock prices: {str(e)}")
+                    return False
+            else:
+                logger.warning("No stock prices data to load")
+                return False
 
-        # Log sample data from ClickHouse
-        logger.info("Sample data from ClickHouse mv_indices (first 3 rows):")
-        for row in indices_result[:3]:
-            logger.info(f"Indices row: {row}")
-
-        logger.info("Sample data from ClickHouse mv_stocks (first 3 rows):")
-        for row in stocks_result[:3]:
-            logger.info(f"Stocks row: {row}")
-
-        # Convert to DataFrames
-        df1 = pl.DataFrame(indices_result, schema=market_metadata_columns, orient="row")
-        df2 = pl.DataFrame(stocks_result, schema=market_metadata_columns, orient="row")
-
-        # Log DataFrame info
-        logger.info(f"Indices DataFrame shape: {df1.shape}")
-        logger.info(f"Stocks DataFrame shape: {df2.shape}")
-        
-        # Log sample data from DataFrames
-        logger.info("Indices DataFrame sample (first 3 rows):")
-        logger.info(df1.head(3).to_dicts())
-        logger.info("Stocks DataFrame sample (first 3 rows):")
-        logger.info(df2.head(3).to_dicts())
-
-        # Combine and deduplicate
-        df = pl.concat([df1, df2]).unique(subset=["security_code"])
-
-        # Log the combined data
-        logger.info(f"Combined DataFrame shape: {df.shape}")
-        logger.info("Combined DataFrame sample (first 3 rows):")
-        logger.info(df.head(3).to_dicts())
-
-        # Convert to Arrow and insert into DuckDB
-        df_arrow = df.to_arrow()
-        
-        # Clear existing data if force=True
-        if force:
-            dd_con.execute("DELETE FROM public.market_metadata")
-            logger.info("Cleared existing market_metadata data")
-        
-        # Insert new data
-        insert_result = dd_con.execute("INSERT INTO public.market_metadata SELECT * FROM df_arrow")
-        
-        # Verify data after insert
-        logger.info("Verifying data in DuckDB after insert:")
-        result = dd_con.execute("""
-            SELECT security_code, symbol, indices_slug, name 
-            FROM public.market_metadata 
-            LIMIT 3
-        """).fetchall()
-        logger.info(f"Sample data in DuckDB: {result}")
-
-        logger.info(f"Inserted {insert_result.rowcount} rows into market_metadata")
-
-    except Exception as e:
-        logger.error(f"Error loading market metadata: {str(e)}", exc_info=True)
-        raise 
+# ... existing code ... 

@@ -13,6 +13,9 @@ from src.modules.db.db_common import (
 from src.modules.db.slug_utils import generate_slug
 from datetime import datetime, timezone
 from src.db.clickhouse import pool as ClickHousePool
+from src.utils.logger import get_logger
+
+logger = get_logger("reference_data_loader")
 
 # Define column lists for DuckDB tables
 companies_columns = ["name"]
@@ -246,100 +249,155 @@ def load_indices_stocks(dd_con=None, force=False):
         return False
 
 def load_market_metadata(dd_con=None, force=False):
-    """Load market metadata into DuckDB"""
+    """Load market metadata from ClickHouse into DuckDB"""
     try:
         if dd_con is None:
             dd_con = ensure_duckdb_schema()
             
-        # Check if the market_metadata table exists
-        table_exists = dd_con.execute("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'market_metadata'").fetchone()[0]
+        # Check if table exists and force refresh if needed
+        table_exists = dd_con.execute("""
+            SELECT COUNT(*) 
+            FROM information_schema.tables 
+            WHERE table_schema = 'public' 
+            AND table_name = 'market_metadata'
+        """).fetchone()[0]
         
-        # Check if we need to refresh the table
-        refresh_needed = force or not table_exists or should_refresh_table(dd_con, "market_metadata", force)
-        
-        if not refresh_needed:
-            # Table exists and doesn't need refresh
-            logging.info(f"Table market_metadata exists and is up to date. Skipping...")
+        if table_exists and not force:
+            logging.info("Market metadata table exists and force=False, skipping")
             return True
             
-        # Create a fresh table
+        # Drop table if it exists
         dd_con.execute("DROP TABLE IF EXISTS public.market_metadata")
+        
+        # Create table with correct schema
         dd_con.execute("""
             CREATE TABLE public.market_metadata (
-                name VARCHAR,
+                security_token VARCHAR,
                 security_code VARCHAR,
-                ticker VARCHAR,
+                company_name VARCHAR,
                 symbol VARCHAR,
-                security_type_code VARCHAR,
-                company_code VARCHAR,
-                meaningful_name VARCHAR,
+                alternate_symbol VARCHAR,
+                nse_index_name VARCHAR,
+                ticker VARCHAR,
+                is_fno BOOLEAN,
+                stocks_count INTEGER,
+                stocks VARCHAR[],
+                security_codes VARCHAR[],
+                security_tokens VARCHAR[],
+                series VARCHAR,
+                category VARCHAR,
+                exchange_group VARCHAR,
+                security_type_code INTEGER,
                 slug VARCHAR
             )
         """)
         
-        # Execute both queries and combine the results
-        ch_pool = ClickHousePool
+        # Load indices data
+        indices_query = """
+        SELECT 
+            security_token,
+            security_code,
+            company_name,
+            symbol,
+            alternate_symbol,
+            nse_index_name,
+            ticker,
+            is_fno,
+            stocks_count,
+            stocks,
+            security_codes,
+            security_tokens,
+            NULL as series,
+            NULL as category,
+            NULL as exchange_group,
+            5 as security_type_code
+        FROM strike.mv_indices
+        """
         
-        # First query
-        result_rows1 = ch_pool.execute_query(metadata_query)
-        if result_rows1:
-            # We know what the columns should be based on the query
-            column_names = ["name", "security_code", "ticker", "symbol", "security_type_code", "company_code", "meaningful_name"]
-            
-            # Convert to DataFrame
-            df1 = pl.DataFrame(result_rows1, schema=column_names, orient="row")
-            
-            # Add slugs
-            df1 = df1.with_columns(
-                pl.col('name').str.to_lowercase().str.replace(" ", "-").alias('slug')
-            )
-        else:
-            df1 = pl.DataFrame(schema=market_metadata_columns + ["slug"])
+        indices_result = ClickHousePool.execute_query(indices_query)
+        if indices_result:
+            for row in indices_result:
+                dd_con.execute("""
+                    INSERT INTO public.market_metadata (
+                        security_token, security_code, company_name, symbol, alternate_symbol, 
+                        nse_index_name, ticker, is_fno, stocks_count, stocks, security_codes, 
+                        security_tokens, series, category, exchange_group, security_type_code
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, [
+                    row.get('security_token'),
+                    row.get('security_code'),
+                    row.get('company_name'),
+                    row.get('symbol'),
+                    row.get('alternate_symbol'),
+                    row.get('nse_index_name'),
+                    row.get('ticker'),
+                    row.get('is_fno'),
+                    row.get('stocks_count'),
+                    row.get('stocks'),
+                    row.get('security_codes'),
+                    row.get('security_tokens'),
+                    None, None, None, 5
+                ])
+            logging.info(f"Loaded {len(indices_result)} indices records")
         
-        # Second query
-        result_rows2 = ch_pool.execute_query(metadata_query2)
-        if result_rows2:
-            # These are the same column names
-            column_names = ["name", "security_code", "ticker", "symbol", "security_type_code", "company_code", "meaningful_name"]
-            
-            # Convert to DataFrame
-            df2 = pl.DataFrame(result_rows2, schema=column_names, orient="row")
-            
-            # Add slugs
-            df2 = df2.with_columns(
-                pl.col('name').str.to_lowercase().str.replace(" ", "-").alias('slug')
-            )
-        else:
-            df2 = pl.DataFrame(schema=market_metadata_columns + ["slug"])
+        # Load stocks data
+        stocks_query = """
+        SELECT 
+            security_token,
+            security_code,
+            company_name,
+            symbol,
+            alternate_symbol,
+            NULL as nse_index_name,
+            ticker,
+            is_fno,
+            NULL as stocks_count,
+            NULL as stocks,
+            NULL as security_codes,
+            NULL as security_tokens,
+            series,
+            category,
+            exchange_group,
+            26 as security_type_code
+        FROM strike.mv_stocks
+        """
         
-        # Combine results
-        df = pl.concat([df1, df2])
+        stocks_result = ClickHousePool.execute_query(stocks_query)
+        if stocks_result:
+            for row in stocks_result:
+                dd_con.execute("""
+                    INSERT INTO public.market_metadata (
+                        security_token, security_code, company_name, symbol, alternate_symbol, 
+                        nse_index_name, ticker, is_fno, stocks_count, stocks, security_codes, 
+                        security_tokens, series, category, exchange_group, security_type_code
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, [
+                    row.get('security_token'),
+                    row.get('security_code'),
+                    row.get('company_name'),
+                    row.get('symbol'),
+                    row.get('alternate_symbol'),
+                    None,
+                    row.get('ticker'),
+                    row.get('is_fno'),
+                    None,
+                    None,
+                    None,
+                    None,
+                    row.get('series'),
+                    row.get('category'),
+                    row.get('exchange_group'),
+                    26
+                ])
+            logging.info(f"Loaded {len(stocks_result)} stocks records")
         
-        # Remove duplicates by security_code, prioritizing non-empty values
-        if len(df) > 0:
-            # First remove obvious duplicates
-            df = df.unique(subset=["security_code"])
-            
-            # Convert to Arrow for DuckDB
-            df_arrow = df.to_arrow()
-            
-            # Insert into DuckDB
-            insert_query = """
-                INSERT INTO public.market_metadata
-                SELECT * FROM df_arrow
-            """
-            dd_con.execute(insert_query)
-            
-            # Store timestamp for this table
-            current_time = datetime.now(timezone.utc)
-            update_sync_timestamp(dd_con, "market_metadata", current_time, full_refresh_required=True)
-            
-            logging.info(f"Market metadata loaded with {len(df)} records")
-        else:
-            logging.warning("No market metadata data found")
+        # Add slug column
+        dd_con.execute("""
+            UPDATE public.market_metadata 
+            SET slug = regexp_replace(lower(company_name), '[^a-z0-9]+', '-', 'g')
+        """)
         
         return True
-        
     except Exception as e:
         logging.error(f"Error loading market metadata: {str(e)}")
         return False
@@ -384,6 +442,48 @@ def add_indices_names_to_companies(dd_con):
         return False
 
 def add_slug_columns_to_tables(dd_con):
+    """Add slug columns to relevant tables"""
+    try:
+        # Add slug column to market_metadata if it doesn't exist
+        dd_con.execute("""
+            ALTER TABLE public.market_metadata 
+            ADD COLUMN IF NOT EXISTS slug VARCHAR
+        """)
+        
+        # Update slug values
+        dd_con.execute("""
+            UPDATE public.market_metadata
+            SET slug = LOWER(REGEXP_REPLACE(company_name, '[^a-zA-Z0-9]', '-'))
+            WHERE slug IS NULL
+        """)
+        
+        return True
+    except Exception as e:
+        logger.error(f"Error adding slug columns: {str(e)}")
+        return False
+
+
+def load_all_reference_data(dd_con, force=False):
+    """Load all reference data into DuckDB"""
+    try:
+        # Load market metadata
+        load_market_metadata(dd_con, force)
+        
+        # Load other reference data
+        load_companies(dd_con, force)
+        load_stocks(dd_con, force)
+        load_indices(dd_con, force)
+        load_indices_stocks(dd_con, force)
+        
+        # Add slug columns
+        add_slug_columns_to_tables(dd_con)
+        
+        return True
+    except Exception as e:
+        logger.error(f"Error loading reference data: {str(e)}")
+        return False
+
+def add_slug_columns_to_tables(dd_con):
     """Add slug columns to all relevant tables after they've been loaded"""
     try:
         # Create the UDF only if it doesn't already exist
@@ -408,59 +508,6 @@ def add_slug_columns_to_tables(dd_con):
         return all_success
     except Exception as e:
         logging.error(f"Error adding slug columns to tables: {str(e)}")
-        return False
-
-
-def load_all_reference_data(force=False):
-    """Load all reference data tables in one operation"""
-    try:
-        dd_con = ensure_duckdb_schema()
-        
-        # Create the UDF only once for the entire process
-        try:
-            dd_con.execute("SELECT generate_slug('test')")
-        except:
-            # Only create the function if it doesn't exist
-            dd_con.create_function("generate_slug", generate_slug, ["VARCHAR"], "VARCHAR")
-        
-        # First load indices
-        indices_result = load_indices(dd_con, force)
-        logging.info(f"Indices data load {'completed successfully' if indices_result else 'had some failures'}")
-        
-        # Add slug columns to indices table - don't create the function again
-        indices_slug_result = add_slug_column_to_table(dd_con, "indices", "name")
-        
-        # Then load companies
-        companies_result = load_companies(dd_con, force)
-        logging.info(f"Companies data load {'completed successfully' if companies_result else 'had some failures'}")
-        
-        # Add slug columns to companies table
-        companies_slug_result = add_slug_column_to_table(dd_con, "companies", "name")
-        
-        # Append unique indices names to companies
-        indices_append_result = add_indices_names_to_companies(dd_con)
-        logging.info(f"Adding indices names to companies {'completed successfully' if indices_append_result else 'had some failures'}")
-        
-        # Load remaining reference data tables
-        results = [
-            indices_result,
-            companies_result,
-            load_stocks(dd_con, force),
-            load_indices_stocks(dd_con, force),
-            load_market_metadata(dd_con, force)
-        ]
-        
-        # Check if all operations were successful
-        all_success = all(results)
-        logging.info(f"All reference data load {'completed successfully' if all_success else 'had some failures'}")
-        
-        # Add slug columns to other tables
-        slug_success = add_slug_columns_to_tables(dd_con)
-        logging.info(f"Slug columns addition {'completed successfully' if slug_success else 'had some failures'}")
-        
-        return all_success and slug_success
-    except Exception as e:
-        logging.error(f"Error loading all reference data: {str(e)}")
         return False
     finally:
         if 'dd_con' in locals():

@@ -1,26 +1,28 @@
-from clickhouse_driver import Client
+from clickhouse_connect import get_client
 import os
 import logging
 
 logger = logging.getLogger(__name__)
 
 def get_clickhouse_connection():
-    """Get a connection to ClickHouse."""
+    """Get a connection to ClickHouse using HTTP protocol."""
     try:
-        host = os.getenv('CLICKHOUSE_HOST', 'localhost')
-        port = int(os.getenv('CLICKHOUSE_PORT', 9000))
-        user = os.getenv('CLICKHOUSE_USER', 'default')
-        password = os.getenv('CLICKHOUSE_PASSWORD', '')
-        database = os.getenv('CLICKHOUSE_DATABASE', 'indiacharts')
+        host = os.getenv('CHDB_HOST', 'localhost')
+        port = int(os.getenv('CHDB_PORT', 8123))  # HTTP default is 8123
+        user = os.getenv('CHDB_USER', 'default')
+        password = os.getenv('CHDB_PASSWORD', '')
+        database = os.getenv('CHDB_NAME', 'default')
         
-        client = Client(
+        logger.info(f"Connecting to ClickHouse HTTP at {host}:{port} with user {user} and database {database}")
+        
+        client = get_client(
             host=host,
             port=port,
-            user=user,
+            username=user,
             password=password,
-            database=database
+            database=database,
+            secure=False  
         )
-        
         return client
     except Exception as e:
         logger.error(f"Error connecting to ClickHouse: {str(e)}", exc_info=True)

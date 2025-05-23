@@ -12,11 +12,12 @@ from src.utils.metrics import (
     record_rrg_data_points, record_rrg_error
 )
 from src.utils.logger import get_logger
-from src.modules.db.data_manager import load_data, load_hourly_data
+from src.modules.db.data_manager import load_data
 from datetime import datetime, timezone
 import numpy as np
 import logging
 from src.utils.duck_pool import get_duckdb_connection
+from src.utils.clickhouse_pool import ClickHousePool
 
 # Configure logger to only show errors
 logger = get_logger("rrg_service")
@@ -56,18 +57,82 @@ class RRGService:
                 raise
 
     async def load_hourly_data(self):
+        """Load hourly stock data"""
         with TimerMetric("load_hourly_data", "rrg_service"):
             start_time = time.time()
             logger.info("Loading hourly data...")
             try:
-                with DuckDBQueryTimer("load_hourly_data"):
-                    load_hourly_data()
-                logger.info(f"Hourly data loaded successfully in {time.time() - start_time:.2f}s")
-                return True
+                with get_duckdb_connection() as conn:
+                    if not conn:
+                        raise Exception("Failed to establish DuckDB connection")
+
+                    # Create table if it doesn't exist
+                    conn.execute("""
+                        CREATE TABLE IF NOT EXISTS public.hourly_stock_data (
+                            timestamp TIMESTAMP WITH TIME ZONE,
+                            symbol VARCHAR,
+                            open_price DOUBLE,
+                            high_price DOUBLE,
+                            low_price DOUBLE,
+                            close_price DOUBLE,
+                            volume BIGINT,
+                            security_code VARCHAR,
+                            ticker VARCHAR
+                        )
+                    """)
+
+                    # Load data from ClickHouse
+                    query = """
+                    SELECT 
+                        date_time as timestamp,
+                        symbol,
+                        open as open_price,
+                        high as high_price,
+                        low as low_price,
+                        close as close_price,
+                        volume,
+                        security_code,
+                        ticker
+                    FROM strike.equity_prices_1min
+                    WHERE date_time >= current_date - interval '3' month
+                    AND toMinute(date_time) % 5 = 0
+                    AND close > 0
+                    ORDER BY date_time DESC
+                    LIMIT 1000
+                    """
+
+                    try:
+                        logger.info("Executing ClickHouse query for hourly data")
+                        result = ClickHousePool.execute_query(query)
+                        
+                        if not result:
+                            logger.warning("No hourly data found in ClickHouse")
+                            raise Exception("No data returned from ClickHouse")
+                            
+                        df = pl.DataFrame(result)
+                        logger.info(f"Retrieved {len(df)} records from ClickHouse")
+                        
+                        if len(df) > 0:
+                            # Convert to Arrow and load into DuckDB
+                            df_arrow = df.to_arrow()
+                            conn.execute("INSERT INTO public.hourly_stock_data SELECT * FROM df_arrow")
+                            logger.info(f"Loaded {len(df)} hourly records into DuckDB")
+                            return True
+                        else:
+                            logger.warning("No hourly data found to load")
+                            raise Exception("No hourly data found to load")
+                            
+                    except Exception as e:
+                        logger.error(f"Error loading hourly data from ClickHouse: {str(e)}")
+                        raise
+
             except Exception as e:
                 record_rrg_error("hourly_data_load")
                 logger.error(f"Failed to load hourly data: {str(e)}", exc_info=True)
                 raise
+
+            logger.info(f"Hourly data loaded successfully in {time.time() - start_time:.2f}s")
+            return True
     
     async def get_rrg_data(self, request: RrgRequest) -> RrgResponse:
         """
@@ -334,62 +399,98 @@ def load_eod_data(days=None):
         days: Number of days of historical data to load
     """
     with TimerMetric("load_eod_data", "rrg_service"):
-        conn = get_duckdb_connection()
-        
         try:
             if days is None:
                 days = 3650  # Default to 10 years
             
-            with DuckDBQueryTimer("eod_data_query"):
-                df = conn.sql(
-                    f"""SELECT 
-                        created_at,
-                        symbol,
-                        close_price,
-                        security_code,
-                        previous_close,
-                        ticker
-                    FROM public.eod_stock_data 
-                    WHERE created_at >= CURRENT_DATE - INTERVAL '{days} days'
-                    AND close_price > 0
-                    ORDER BY created_at ASC"""
-                ).pl()
-            
-            return df
+            with get_duckdb_connection() as conn:
+                with DuckDBQueryTimer("eod_data_query"):
+                    df = conn.sql(
+                        f"""SELECT 
+                            created_at,
+                            symbol,
+                            close_price,
+                            security_code,
+                            previous_close,
+                            ticker
+                        FROM public.eod_stock_data 
+                        WHERE created_at >= CURRENT_DATE - INTERVAL '{days} days'
+                        AND close_price > 0
+                        ORDER BY created_at ASC"""
+                    ).pl()
+                
+                return df
         except Exception as e:
             logger.error(f"[RRG Service] Error loading EOD data: {str(e)}", exc_info=True)
             return None
 
-def load_hourly_data(days=None):
-    """
-    Load hourly data from DuckDB.
-    
-    Args:
-        days: Number of days of historical data to load
-    """
-    with TimerMetric("load_hourly_data", "rrg_service"):
-        conn = get_duckdb_connection()
-        
-        try:
-            if days is None:
-                days = 3650  # Default to 10 years
-            
-            with DuckDBQueryTimer("hourly_data_query"):
-                df = conn.sql(
-                    f"""SELECT 
-                        created_at,
-                        symbol,
-                        current_price as close_price,
-                        security_code,
-                        previous_close,
-                        ticker
-                    FROM public.stock_prices
-                    WHERE created_at >= CURRENT_DATE - INTERVAL '{days} days'
-                    AND current_price > 0
-                    ORDER BY created_at ASC"""
-                ).pl()
-            
-            return df
-        except Exception as e:
-            logger.error(f"[RRG Service] Error loading hourly data: {str(e)}", exc_info=True)
-            return None
+def load_hourly_data():
+    """Load hourly stock data"""
+    try:
+        with get_duckdb_connection() as conn:
+            if not conn:
+                raise Exception("Failed to establish DuckDB connection")
+
+            # Create table if it doesn't exist
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS public.hourly_stock_data (
+                    timestamp TIMESTAMP WITH TIME ZONE,
+                    symbol VARCHAR,
+                    open_price DOUBLE,
+                    high_price DOUBLE,
+                    low_price DOUBLE,
+                    close_price DOUBLE,
+                    volume BIGINT,
+                    security_code VARCHAR,
+                    ticker VARCHAR
+                )
+            """)
+
+            # Load data from ClickHouse
+            query = """
+            SELECT 
+                date_time as timestamp,
+                symbol,
+                open as open_price,
+                high as high_price,
+                low as low_price,
+                close as close_price,
+                volume,
+                security_code,
+                ticker
+            FROM strike.equity_prices_1min
+            WHERE date_time >= current_date - interval '3' month
+            AND toMinute(date_time) % 5 = 0
+            AND close > 0
+            ORDER BY date_time DESC
+            LIMIT 1000
+            """
+
+            try:
+                logger.info("Executing ClickHouse query for hourly data")
+                result = ClickHousePool.execute_query(query)
+                
+                if not result:
+                    logger.warning("No hourly data found in ClickHouse")
+                    raise Exception("No data returned from ClickHouse")
+                    
+                df = pl.DataFrame(result)
+                logger.info(f"Retrieved {len(df)} records from ClickHouse")
+                
+                if len(df) > 0:
+                    # Convert to Arrow and load into DuckDB
+                    df_arrow = df.to_arrow()
+                    conn.execute("INSERT INTO public.hourly_stock_data SELECT * FROM df_arrow")
+                    logger.info(f"Loaded {len(df)} hourly records into DuckDB")
+                    return True
+                else:
+                    logger.warning("No hourly data found to load")
+                    raise Exception("No hourly data found to load")
+                    
+            except Exception as e:
+                logger.error(f"Error loading hourly data from ClickHouse: {str(e)}")
+                raise
+
+    except Exception as e:
+        logger.error(f"Error in load_hourly_data: {str(e)}")
+        raise
