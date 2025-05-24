@@ -20,6 +20,8 @@ from src.utils.duck_pool import get_duckdb_connection
 from src.utils.clickhouse_pool import pool as ClickHousePool
 from src.modules.db.config import MAX_RECORDS
 import pandas as pd
+from .helper.csv_generator import CSVCenerator
+from .helper.rrg_executor import RRGExecutor
 
 # Configure logger to show INFO level logs
 logger = get_logger("rrg_service")
@@ -51,6 +53,8 @@ class RRGService:
     def __init__(self):
         self.cache_manager = CacheManager("rrg")
         self.db_path = 'data/pydb.duckdb'
+        self.csv_generator = None
+        self.rrg_executor = RRGExecutor()
         logger.debug("RRGService initialized")
 
     async def load_hourly_data(self):
@@ -194,16 +198,16 @@ class RRGService:
             with get_duckdb_connection() as conn:
                 # Get index stocks
                 index_query = f"""
-                    SELECT 
-                        security_code,
-                        ticker,
-                        symbol,
-                        company_name as name,
-                        nse_index_name as meaningful_name,
-                        slug,
-                        security_type_code
-                    FROM public.market_metadata 
-                    WHERE symbol = '{request.index_symbol}'
+                    SELECT DISTINCT
+                        m.security_code,
+                        m.ticker,
+                        m.symbol,
+                        m.company_name as name,
+                        m.nse_index_name as meaningful_name,
+                        m.slug,
+                        m.security_type_code
+                    FROM public.market_metadata m
+                    WHERE m.symbol = '{request.index_symbol}'
                 """
                 index_result = conn.execute(index_query).fetchdf()
                 logger.info(f"Index query result: {index_result.to_dict('records')}")
@@ -217,32 +221,50 @@ class RRGService:
                         error=f"Index not found: {request.index_symbol}"
                     )
                 
-                # Get price data
-                query = f"""
-                    SELECT 
-                        e.created_at,
-                        e.ratio,
-                        e.momentum,
-                        e.close_price,
-                        e.change_percentage,
-                        e.metric_1,
-                        e.metric_2,
-                        e.metric_3,
-                        e.signal,
-                        e.security_code,
-                        e.previous_close,
-                        s.ticker,
-                        s.symbol,
-                        s.company_name as name,
-                        s.nse_index_name as meaningful_name,
-                        s.slug,
-                        s.security_type_code
-                    FROM public.eod_stock_data e
-                    JOIN public.market_metadata s ON e.security_code = s.security_code
-                    WHERE e.security_code IN ({','.join([f"'{code}'" for code in index_result['security_code'].tolist()])})
-                    AND e.created_at >= CURRENT_DATE - INTERVAL '{request.date_range}' DAY
-                    ORDER BY e.created_at DESC
-                """
+                # Get stock codes for the index
+                stock_codes = index_result['security_code'].tolist()
+                logger.info(f"Stock codes for index {request.index_symbol}: {stock_codes}")
+                
+                # Determine data source based on timeframe
+                if request.timeframe in ["15m", "30m", "1h"]:
+                    # Use stock_prices for minute-based timeframes
+                    query = f"""
+                        SELECT 
+                            p.created_at,
+                            p.close_price,
+                            p.security_code,
+                            m.ticker,
+                            m.symbol,
+                            m.company_name as name,
+                            m.nse_index_name as meaningful_name,
+                            m.slug,
+                            m.security_type_code
+                        FROM public.stock_prices p
+                        JOIN public.market_metadata m ON p.security_code = m.security_code
+                        WHERE p.security_code IN ({','.join([f"'{code}'" for code in stock_codes])})
+                        AND p.created_at >= CURRENT_DATE - INTERVAL '{request.date_range * 3}' DAY
+                        ORDER BY p.created_at DESC
+                    """
+                else:
+                    # Use eod_stock_data for daily/weekly/monthly
+                    query = f"""
+                        SELECT 
+                            e.created_at,
+                            e.close_price,
+                            e.security_code,
+                            m.ticker,
+                            m.symbol,
+                            m.company_name as name,
+                            m.nse_index_name as meaningful_name,
+                            m.slug,
+                            m.security_type_code
+                        FROM public.eod_stock_data e
+                        JOIN public.market_metadata m ON e.security_code = m.security_code
+                        WHERE e.security_code IN ({','.join([f"'{code}'" for code in stock_codes])})
+                        AND e.created_at >= CURRENT_DATE - INTERVAL '{request.date_range}' DAY
+                        ORDER BY e.created_at DESC
+                    """
+                
                 result = conn.execute(query).fetchdf()
                 logger.info(f"Price data query returned {len(result)} rows")
                 
@@ -255,7 +277,7 @@ class RRGService:
                         error=f"No price data found for stocks in index: {request.index_symbol}"
                     )
                 
-                # Transform data into RRG format
+                # Transform data into initial RRG format
                 rrg_data = {
                     "benchmark": request.index_symbol,
                     "indexdata": [],
@@ -280,14 +302,9 @@ class RRGService:
                         for _, row in ticker_data.iterrows():
                             point = [
                                 row['created_at'].strftime('%Y-%m-%d %H:%M:%S'),
-                                str(row['ratio']),
-                                str(row['momentum']),
-                                str(row['close_price']),
-                                str(row['change_percentage']),
-                                str(row['metric_1']),
-                                str(row['metric_2']),
-                                str(row['metric_3']),
-                                str(row['signal'])
+                                "0",  # ratio will be calculated by RRG binary
+                                "0",  # momentum will be calculated by RRG binary
+                                str(row['close_price'])
                             ]
                             ticker_points.append(point)
                         
@@ -316,30 +333,38 @@ class RRGService:
                         change = {
                             "symbol": ticker,
                             "created_at": start_date.strftime('%Y-%m-%d'),
-                            "change_percentage": float(first_day_data['change_percentage']) if not pd.isna(first_day_data['change_percentage']) else None,
-                            "close_price": float(first_day_data['close_price']),
-                            "momentum": str(first_day_data['momentum']),
-                            "ratio": str(first_day_data['ratio'])
+                            "change_percentage": 0,  # Will be calculated by RRG binary
+                            "close_price": float(first_day_data['close_price'])
                         }
                         rrg_data["change_data"].append(change)
                         logger.info(f"Added change data for {ticker}: {change}")
+                
+                # Generate CSV and process with RRG binary
+                self.csv_generator = CSVCenerator(request.index_symbol)
+                input_file, output_file = self.csv_generator.generate_csv(rrg_data, request.timeframe)
+                
+                # Execute RRG binary
+                processed_data = self.rrg_executor.execute(input_file, output_file, request.timeframe)
+                
+                # Merge momentum data
+                final_data = self.rrg_executor._merge_momentum(processed_data, rrg_data["change_data"], request.timeframe)
                 
                 # Generate filename
                 filename = f"{request.index_symbol}_{'_'.join(request.tickers)}_{request.timeframe}_{request.date_range}_{datetime.now().strftime('%Y-%m-%dT%H:%M:%S.000Z')}"
                 
                 # Log final response structure
                 logger.info(f"Final RRG response structure:")
-                logger.info(f"- Benchmark: {rrg_data['benchmark']}")
-                logger.info(f"- Number of index points: {len(rrg_data['indexdata'])}")
-                logger.info(f"- Number of datalists: {len(rrg_data['datalists'])}")
+                logger.info(f"- Benchmark: {final_data['benchmark']}")
+                logger.info(f"- Number of index points: {len(final_data['indexdata'])}")
+                logger.info(f"- Number of datalists: {len(final_data['datalists'])}")
                 logger.info(f"- Number of change data entries: {len(rrg_data['change_data'])}")
                 
                 # Cache the RRG data
-                self.cache_manager.setCache(cache_key, json.dumps(rrg_data), expiry_in_minutes=60)  # Cache for 1 hour
+                self.cache_manager.setCache(cache_key, json.dumps(final_data), expiry_in_minutes=60)  # Cache for 1 hour
                 
                 return RrgResponse(
                     status="success",
-                    data=rrg_data,
+                    data=final_data,
                     filename=filename,
                     cacheHit=False
                 )
