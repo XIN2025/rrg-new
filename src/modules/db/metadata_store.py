@@ -21,13 +21,13 @@ class RRGMetadataStore:
                     
                 query = """
                     SELECT 
-                        name,
+                        company_name as name,
                         security_code,
                         ticker,
                         symbol,
                         security_type_code,
-                        company_code,
-                        meaningful_name
+                        security_token as company_code,
+                        company_name as meaningful_name
                     FROM public.market_metadata
                 """
                 

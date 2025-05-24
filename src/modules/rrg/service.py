@@ -203,8 +203,8 @@ class RRGService:
                         m.ticker,
                         m.symbol,
                         m.company_name as name,
-                        m.nse_index_name as meaningful_name,
-                        m.slug,
+                        m.company_name as meaningful_name,
+                        LOWER(REPLACE(m.company_name, ' ', '-')) as slug,
                         m.security_type_code
                     FROM public.market_metadata m
                     WHERE m.symbol = '{request.index_symbol}'

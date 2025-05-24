@@ -82,14 +82,20 @@ def init_database() -> bool:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS public.market_metadata (
                     security_token VARCHAR,
+                    security_code VARCHAR,
                     company_name VARCHAR,
                     symbol VARCHAR,
                     alternate_symbol VARCHAR,
+                    ticker VARCHAR,
+                    is_fno BOOLEAN,
+                    stocks_count INTEGER,
+                    stocks VARCHAR,
+                    security_codes VARCHAR,
+                    security_tokens VARCHAR,
                     series VARCHAR,
                     category VARCHAR,
-                    ticker VARCHAR,
                     exchange_group VARCHAR,
-                    is_fno BOOLEAN
+                    security_type_code INTEGER
                 )
             """)
             
@@ -131,14 +137,20 @@ def init_database() -> bool:
             metadata_query = """
                 SELECT 
                     security_token,
+                    security_code,
                     company_name,
                     symbol,
                     alternate_symbol,
+                    ticker,
+                    is_fno,
+                    NULL as stocks_count,
+                    NULL as stocks,
+                    NULL as security_codes,
+                    NULL as security_tokens,
                     series,
                     category,
-                    ticker,
                     exchange_group,
-                    is_fno
+                    26 as security_type_code
                 FROM strike.mv_stocks
                 WHERE symbol IS NOT NULL
             """
@@ -147,8 +159,8 @@ def init_database() -> bool:
             if metadata_data:
                 conn.executemany("""
                     INSERT INTO public.market_metadata 
-                    (security_token, company_name, symbol, alternate_symbol, series, category, ticker, exchange_group, is_fno)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (security_token, security_code, company_name, symbol, alternate_symbol, ticker, is_fno, stocks_count, stocks, security_codes, security_tokens, series, category, exchange_group, security_type_code)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, metadata_data)
                 logger.info(f"Loaded {len(metadata_data)} market metadata records")
             

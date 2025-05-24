@@ -1,7 +1,7 @@
-import os
 import logging
 from clickhouse_connect import get_client
 from clickhouse_connect.driver.exceptions import DatabaseError
+from src.config import CHDB_HOST, CHDB_PORT, CHDB_USER, CHDB_PASSWORD, CHDB_NAME, CHDB_SECURE
 
 logger = logging.getLogger("clickhouse")
 logger.setLevel(logging.INFO)
@@ -30,20 +30,20 @@ class ClickHousePool:
     def _initialize_client(self):
         try:
             logger.info("Initializing ClickHouse connection...")
-            logger.info(f"CHDB_HOST: {os.getenv('CHDB_HOST')}")
-            logger.info(f"CHDB_PORT: {os.getenv('CHDB_PORT')}")
-            logger.info(f"CHDB_USER: {os.getenv('CHDB_USER')}")
-            logger.info(f"CHDB_PASSWORD: {'*' * len(os.getenv('CHDB_PASSWORD', ''))}")
-            logger.info(f"CHDB_NAME: {os.getenv('CHDB_NAME')}")
-            logger.info(f"CHDB_SECURE: {os.getenv('CHDB_SECURE')}")
+            logger.info(f"CHDB_HOST: {CHDB_HOST}")
+            logger.info(f"CHDB_PORT: {CHDB_PORT}")
+            logger.info(f"CHDB_USER: {CHDB_USER}")
+            logger.info(f"CHDB_PASSWORD: {'*' * len(CHDB_PASSWORD)}")
+            logger.info(f"CHDB_NAME: {CHDB_NAME}")
+            logger.info(f"CHDB_SECURE: {CHDB_SECURE}")
 
             self._client = get_client(
-                host=os.getenv('CHDB_HOST'),
-                port=int(os.getenv('CHDB_PORT', 8123)),
-                username=os.getenv('CHDB_USER'),
-                password=os.getenv('CHDB_PASSWORD'),
-                database=os.getenv('CHDB_NAME'),
-                secure=os.getenv('CHDB_SECURE', 'False').lower() == 'true'
+                host=CHDB_HOST,
+                port=CHDB_PORT,
+                username=CHDB_USER,
+                password=CHDB_PASSWORD,
+                database=CHDB_NAME,
+                secure=CHDB_SECURE
             )
             logger.info("ClickHouse connection initialized successfully")
         except Exception as e:

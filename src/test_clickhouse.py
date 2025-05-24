@@ -1,10 +1,21 @@
 from db.clickhouse import ClickHousePool
 import logging
 from datetime import datetime, timedelta
+import clickhouse_connect
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ClickHouse connection settings (hardcoded for test)
+client = clickhouse_connect.get_client(
+    host='api-uat-v2.strike.money',
+    port=18123,
+    username='open_gig',
+    password='open_gig_at_strike_IC',
+    database='strike',
+    secure=False
+)
 
 def test_clickhouse_connection():
     try:
@@ -51,6 +62,46 @@ def test_clickhouse_connection():
     except Exception as e:
         logger.error(f"Connection test failed: {str(e)}")
         return False
+
+# List all tables in the database
+tables_query = "SHOW TABLES"
+tables_result = client.query(tables_query)
+tables = [row[0] for row in tables_result.result_rows]
+
+print("Tables in ClickHouse database:")
+for table in tables:
+    print(f"- {table}")
+
+# For each table, print a sample of data
+for table in tables:
+    sample_query = f"SELECT * FROM {table} LIMIT 2"
+    try:
+        sample_result = client.query(sample_query)
+        print(f"\nSample data from {table}:")
+        for row in sample_result.result_rows:
+            print(row)
+    except Exception as e:
+        print(f"Error querying {table}: {str(e)}")
+
+# Print a sample from dion_company_master
+table = 'dion_company_master'
+try:
+    sample_result = client.query(f"SELECT * FROM {table} LIMIT 2")
+    print(f"\nSample data from {table}:")
+    for row in sample_result.result_rows:
+        print(row)
+except Exception as e:
+    print(f"Error querying {table}: {str(e)}")
+
+# Print a sample from dion_index_master
+table = 'dion_index_master'
+try:
+    sample_result = client.query(f"SELECT * FROM {table} LIMIT 2")
+    print(f"\nSample data from {table}:")
+    for row in sample_result.result_rows:
+        print(row)
+except Exception as e:
+    print(f"Error querying {table}: {str(e)}")
 
 if __name__ == "__main__":
     success = test_clickhouse_connection()

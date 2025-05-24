@@ -68,9 +68,21 @@ def load_market_metadata(force_reload=False):
         print("Loading market metadata...")
         query = """
             SELECT 
+                security_token,
                 security_code,
+                company_name,
+                symbol,
+                alternate_symbol,
                 ticker,
-                symbol
+                is_fno,
+                NULL as stocks_count,
+                NULL as stocks,
+                NULL as security_codes,
+                NULL as security_tokens,
+                series,
+                category,
+                exchange_group,
+                26 as security_type_code
             FROM strike.mv_stocks
         """
         
@@ -79,10 +91,10 @@ def load_market_metadata(force_reload=False):
             print("No market metadata returned from ClickHouse")
             return False
         df = pl.DataFrame(result, schema=[
-            "security_code", "ticker", "symbol"
+            "security_token", "security_code", "company_name", "symbol", "alternate_symbol",
+            "ticker", "is_fno", "stocks_count", "stocks", "security_codes", "security_tokens",
+            "series", "category", "exchange_group", "security_type_code"
         ])
-        now = datetime.now()
-        df = df.with_columns(pl.lit(now).alias("created_at"))
         print(f"Fetched {len(df)} market metadata records")
         
         with get_duckdb_connection() as conn:
@@ -93,10 +105,21 @@ def load_market_metadata(force_reload=False):
             conn.execute("DROP TABLE IF EXISTS public.market_metadata")
             conn.execute("""
                 CREATE TABLE public.market_metadata (
+                    security_token VARCHAR,
                     security_code VARCHAR,
-                    ticker VARCHAR,
+                    company_name VARCHAR,
                     symbol VARCHAR,
-                    created_at TIMESTAMP
+                    alternate_symbol VARCHAR,
+                    ticker VARCHAR,
+                    is_fno BOOLEAN,
+                    stocks_count INTEGER,
+                    stocks VARCHAR,
+                    security_codes VARCHAR,
+                    security_tokens VARCHAR,
+                    series VARCHAR,
+                    category VARCHAR,
+                    exchange_group VARCHAR,
+                    security_type_code INTEGER
                 )
             """)
             

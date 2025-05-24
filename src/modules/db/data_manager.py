@@ -64,7 +64,6 @@ def ensure_tables_exist():
                     company_name VARCHAR,
                     symbol VARCHAR,
                     alternate_symbol VARCHAR,
-                    nse_index_name VARCHAR,
                     ticker VARCHAR,
                     is_fno BOOLEAN,
                     stocks_count INTEGER,
@@ -74,8 +73,7 @@ def ensure_tables_exist():
                     series VARCHAR,
                     category VARCHAR,
                     exchange_group VARCHAR,
-                    security_type_code INTEGER,
-                    slug VARCHAR
+                    security_type_code INTEGER
                 )
             """)
             
@@ -436,7 +434,6 @@ def test_database_setup():
                     company_name VARCHAR,
                     symbol VARCHAR,
                     alternate_symbol VARCHAR,
-                    nse_index_name VARCHAR,
                     ticker VARCHAR,
                     is_fno BOOLEAN,
                     stocks_count INTEGER,
@@ -446,8 +443,7 @@ def test_database_setup():
                     series VARCHAR,
                     category VARCHAR,
                     exchange_group VARCHAR,
-                    security_type_code INTEGER,
-                    slug VARCHAR
+                    security_type_code INTEGER
                 )
             """)
             

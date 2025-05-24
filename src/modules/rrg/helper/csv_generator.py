@@ -9,17 +9,18 @@ logger = logging.getLogger(__name__)
 class CSVCenerator:
     def __init__(self, benchmark_ticker: str):
         self.benchmark_ticker = benchmark_ticker
-        self.input_folder = "src/modules/rrg/exports/input"
-        self.output_folder = "src/modules/rrg/exports/output"
+        # Use absolute paths
+        self.input_folder = os.path.abspath("src/modules/rrg/exports/input")
+        self.output_folder = os.path.abspath("src/modules/rrg/exports/output")
         
     def _create_folders(self):
-        """Create necessary folders if they don't exist"""
+        """Create input and output folders if they don't exist"""
         os.makedirs(self.input_folder, exist_ok=True)
         os.makedirs(self.output_folder, exist_ok=True)
         
     def _generate_filename(self) -> str:
         """Generate a unique filename based on timestamp"""
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         return f"rrg_data_{self.benchmark_ticker}_{timestamp}"
         
     def _aggregate_data(self, df: pd.DataFrame, timeframe: str) -> pd.DataFrame:

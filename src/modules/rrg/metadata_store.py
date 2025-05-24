@@ -14,6 +14,7 @@ from src.modules.rrg.time_utils import return_filter_days
 import time as t
 import logging
 from typing import List, Optional
+from src.utils.clickhouse_pool import ClickHousePool
 
 INDIAN_TZ = "Asia/Kolkata"
 
@@ -70,45 +71,54 @@ class RRGMetadataStore:
         self.ensure_metadata_loaded()
 
     def _load_metadata(self):
-        """Internal function to load metadata from DuckDB."""
+        """Internal function to load metadata from DuckDB and ClickHouse."""
         try:
             with get_duckdb_connection() as conn:
-                # Query market_metadata table with correct schema
-                self._indices_df = conn.sql("""
-                    SELECT 
-                        security_code, 
-                        symbol,
-                        ticker,
-                        nse_index_name AS company_name,
-                        security_type_code
-                    FROM public.market_metadata 
-                    WHERE symbol IS NOT NULL
-                    AND security_type_code IN ('5', '26')  -- Indices
-                """).pl()
-                
-                self._stocks_df = conn.sql("""
-                    SELECT 
-                        security_code, 
-                        symbol,
-                        ticker,
-                        company_name,
-                        security_type_code
-                    FROM public.market_metadata 
-                    WHERE symbol IS NOT NULL
-                    AND security_type_code NOT IN ('5', '26')  -- Non-indices
-                """).pl()
-                
-                # Load market metadata
+                # Load market metadata from DuckDB
                 self._market_metadata_df = conn.sql("""
                     SELECT 
+                        security_token,
                         security_code,
+                        company_name,
                         symbol,
+                        alternate_symbol,
                         ticker,
-                        COALESCE(company_name, nse_index_name) AS company_name,
+                        is_fno,
+                        stocks_count,
+                        stocks,
+                        security_codes,
+                        security_tokens,
+                        series,
+                        category,
+                        exchange_group,
                         security_type_code
-                    FROM public.market_metadata
+                    FROM public.market_metadata 
                     WHERE symbol IS NOT NULL
                 """).pl()
+                
+                # Load indices from ClickHouse dion_index_master (only columns that exist, small sample)
+                ch_pool = ClickHousePool()
+                indices_query = """
+                    SELECT 
+                        security_code,
+                        index_name as name,
+                        created_at
+                    FROM strike.dion_index_master
+                    LIMIT 2
+                    """
+                indices_result = ch_pool.execute_query(indices_query)
+                self._indices_df = pl.DataFrame(indices_result)
+                
+                # Load stocks from ClickHouse dion_company_master (only columns that exist, small sample)
+                stocks_query = """
+                    SELECT 
+                        company_name as name,
+                        created_at
+                    FROM strike.dion_company_master
+                    LIMIT 2
+                    """
+                stocks_result = ch_pool.execute_query(stocks_query)
+                self._stocks_df = pl.DataFrame(stocks_result)
                 
                 logger.info(f"Loaded {len(self._indices_df)} indices, {len(self._stocks_df)} stocks, and {len(self._market_metadata_df)} total market metadata records")
                 return True

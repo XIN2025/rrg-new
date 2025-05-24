@@ -383,7 +383,7 @@ def generate_csv(tickers: List[str], date_range: str, index_symbol: str, timefra
         formatted_data = format_rrg_data(combined_data, metadata_df, index_symbol)
         
         # Create output directory if it doesn't exist
-        output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "exports", "output", filename)
+        output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "exports", "output")
         os.makedirs(output_dir, exist_ok=True)
         
         # Save the formatted data
@@ -392,7 +392,7 @@ def generate_csv(tickers: List[str], date_range: str, index_symbol: str, timefra
             json.dump(formatted_data, f, indent=2)
         
         # Create input CSV file for RRG binary
-        input_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "exports", "input", filename)
+        input_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "exports", "input")
         os.makedirs(input_dir, exist_ok=True)
         
         # Create CSV with proper format
@@ -465,6 +465,14 @@ def generate_csv(tickers: List[str], date_range: str, index_symbol: str, timefra
             for row in csv_data:
                 f.write(",".join(row) + "\n")
         
+        # Log the first few lines of the generated CSV for debugging
+        try:
+            with open(csv_path, "r", encoding="utf-8") as f:
+                lines = [next(f) for _ in range(5)]
+            logger.info(f"First 5 lines of generated CSV {csv_path}:\n{''.join(lines)}")
+        except Exception as e:
+            logger.warning(f"Could not read first lines of CSV {csv_path}: {e}")
+        
         # Add cache hit status and error field to match original response
         response = {
             "data": formatted_data["data"],
@@ -506,8 +514,8 @@ def test_csv_generation(tickers: List[str], date_range: str, index_symbol: str =
         filename = f"test_rrg_{timestamp}_{tickers_hash}"
         
         # Create output directories
-        output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "exports", "output", filename)
-        input_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "exports", "input", filename)
+        output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "exports", "output")
+        input_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "exports", "input")
         os.makedirs(output_dir, exist_ok=True)
         os.makedirs(input_dir, exist_ok=True)
         
