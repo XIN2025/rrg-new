@@ -11,6 +11,7 @@ from src.modules.rrg.metadata_store import get_metadata_status, refresh_metadata
 import time
 import logging
 from datetime import datetime, timedelta
+from src.utils.duck_pool import get_duckdb_connection
 
 # Configure logger
 logger = get_logger("rrg_router")
@@ -19,24 +20,22 @@ router = APIRouter(prefix="/rrg", tags=["RRG"])
 service = RRGService()
 
 
-@router.post("", response_model=RrgResponse)
-async def get_rrg_data(
-    request: RrgRequest,
-    # current_user: str = Depends(get_current_user)
-):
-    with RRGRequestMetrics(request.timeframe, request.index_symbol, request.date_range):
-        with TimerMetric("get_rrg_data_endpoint", "rrg_router"):
-            start_time = time.time()
-            logger.info(f"Request received: index={request.index_symbol}, timeframe={request.timeframe}, date_range={request.date_range}")
+@router.post("/", response_model=RrgResponse)
+async def get_rrg_data(request: RrgRequest):
+    """Get RRG data for the specified request"""
+    try:
+        logger.info(f"Processing RRG request for index: {request.index_symbol}, timeframe: {request.timeframe}")
+        
+        response = await service.get_rrg_data(request)
+        
+        if not response:
+            raise HTTPException(status_code=500, detail="Failed to get RRG data")
             
-            try:
-                result = await service.get_rrg_data(request)
-                logger.info(f"Request completed in {time.time() - start_time:.2f}s")
-                return result
-            except Exception as e:
-                record_rrg_error("endpoint_error")
-                logger.error(f"Error generating RRG data: {str(e)}", exc_info=True)
-                raise HTTPException(status_code=500, detail=str(e))
+        return response
+        
+    except Exception as e:
+        logger.error(f"Error getting RRG data: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # Metadata status and refresh endpoints
@@ -106,28 +105,28 @@ async def refresh_metadata_endpoint(
 async def load_eod_data(
     current_user: str = Depends(get_current_user)
 ):
-    with TimerMetric("load_eod_data_endpoint", "rrg_router"):
-        start_time = time.time()
-        logger.info(f"EOD data load requested by user: {current_user}")
-
-        try:
-            # Calculate date range (last 10 years)
-            end_date = datetime.now().strftime("%Y-%m-%d")
-            start_date = (datetime.now() - timedelta(days=3650)).strftime("%Y-%m-%d")
+    """Load EOD data from ClickHouse to DuckDB - Only call this manually when needed"""
+    try:
+        logger.info("Manual EOD data load requested")
+        service = RRGService()
+        
+        # Load last 10 years of data
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=365*10)
+        
+        success = await service.load_data(
+            start_date=start_date.strftime('%Y-%m-%d'),
+            end_date=end_date.strftime('%Y-%m-%d')
+        )
+        
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to load EOD data")
             
-            await service.load_data(start_date=start_date, end_date=end_date)
-            elapsed_time = time.time() - start_time
-            logger.info(f"EOD data loaded in {elapsed_time:.2f}s")
-            
-            # Refresh metadata after loading new data
-            logger.debug("Refreshing metadata after EOD data load")
-            refresh_metadata()
-            
-            return StatusResponse(status="Updated EOD stock data and refreshed metadata")
-        except Exception as e:
-            record_rrg_error("eod_data_load_endpoint")
-            logger.error(f"Error loading EOD data: {str(e)}", exc_info=True)
-            raise HTTPException(status_code=500, detail=str(e))
+        return {"status": "success", "message": "EOD data loaded successfully"}
+        
+    except Exception as e:
+        logger.error(f"Error loading EOD data: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # Fetches intraday/hourly price history (indiacharts.stock_prices from PG for last 6 months) -> public.stock_prices (DuckDB)
@@ -178,4 +177,42 @@ async def update_hourly_data():
 
 # If timeframe ends in 'm' (minutes/hourly), it queries public.stock_prices.
 # Otherwise (daily, weekly, monthly), it queries public.eod_stock_data.
+
+@router.get("/metadata/check")
+async def check_metadata():
+    """Check metadata tables without loading data"""
+    try:
+        with get_duckdb_connection('data/pydb.duckdb') as conn:
+            # Check if tables exist
+            tables = conn.execute("""
+                SELECT table_name 
+                FROM information_schema.tables 
+                WHERE table_schema = 'public'
+            """).fetchdf()
+            
+            # Test indices table
+            indices = conn.execute("""
+                SELECT * FROM public.indices LIMIT 5
+            """).fetchdf()
+            
+            # Test stocks table
+            stocks = conn.execute("""
+                SELECT * FROM public.stocks LIMIT 5
+            """).fetchdf()
+            
+            # Test indices_stocks table
+            index_stocks = conn.execute("""
+                SELECT * FROM public.indices_stocks LIMIT 5
+            """).fetchdf()
+            
+            return {
+                "status": "success",
+                "tables": tables.to_dict('records'),
+                "indices": indices.to_dict('records'),
+                "stocks": stocks.to_dict('records'),
+                "index_stocks": index_stocks.to_dict('records')
+            }
+    except Exception as e:
+        logger.error(f"Error checking metadata: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 

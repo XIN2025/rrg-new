@@ -13,11 +13,13 @@ from src.utils.metrics import (
 )
 from src.utils.logger import get_logger
 from src.modules.db.data_manager import load_data
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import numpy as np
 import logging
 from src.utils.duck_pool import get_duckdb_connection
-from src.utils.clickhouse_pool import pool
+from src.utils.clickhouse_pool import pool as ClickHousePool
+from src.modules.db.config import MAX_RECORDS
+import pandas as pd
 
 # Configure logger to show INFO level logs
 logger = get_logger("rrg_service")
@@ -48,16 +50,43 @@ def clean_for_json(obj):
 class RRGService:
     def __init__(self):
         self.cache_manager = CacheManager("rrg")
+        self.db_path = 'data/pydb.duckdb'
         logger.debug("RRGService initialized")
 
     async def load_hourly_data(self):
         """Load hourly stock data without chunk size limitations."""
         pass
 
-    async def load_data(self, start_date: str, end_date: str) -> None:
-        """Load data for the specified date range"""
+    async def load_data(self, start_date=None, end_date=None):
+        """Load EOD data from ClickHouse to DuckDB, only if DuckDB is empty."""
         try:
-            # Get total count of records
+            # Set default dates if not provided
+            if not end_date:
+                end_date = datetime.now().strftime('%Y-%m-%d')
+            if not start_date:
+                start_date = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
+
+            # Check if DuckDB table exists and has data
+            with get_duckdb_connection(self.db_path) as conn:
+                table_exists = False
+                try:
+                    res = conn.execute("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public' AND table_name='eod_stock_data'").fetchone()
+                    table_exists = res[0] > 0
+                except Exception as e:
+                    logger.info("Table check failed, assuming table does not exist.")
+                    table_exists = False
+                if table_exists:
+                    try:
+                        count = conn.execute("SELECT COUNT(*) FROM public.eod_stock_data").fetchone()[0]
+                        if count > 0:
+                            logger.info(f"DuckDB already has {count} records in eod_stock_data. Skipping load.")
+                            return True
+                    except Exception as e:
+                        logger.info("eod_stock_data table exists but count failed, will reload.")
+
+            logger.info(f"Loading data from {start_date} to {end_date}")
+
+            # Count total records to load
             count_query = f"""
                 SELECT COUNT(*) as total
                 FROM strike.equity_prices_1d e
@@ -65,112 +94,264 @@ class RRGService:
                 WHERE e.date_time BETWEEN '{start_date}' AND '{end_date}'
                 AND e.close > 0
             """
-            result = pool.execute_query(count_query)
+            result = ClickHousePool.execute_query(count_query)
             total_records = result[0][0]
-            
-            if total_records == 0:
-                logger.info(f"No data found for period {start_date} to {end_date}")
-                return
-                
             logger.info(f"Found {total_records:,} records to load")
-            
-            # Load all data at once
-            query = f"""
-                WITH ordered_data AS (
-                    SELECT
-                        e.date_time as created_at,
-                        s.symbol,
-                        e.close as close_price,
-                        e.security_code,
-                        lagInFrame(e.close) OVER (PARTITION BY s.security_code ORDER BY e.date_time) as previous_close,
-                        s.ticker
-                    FROM strike.equity_prices_1d e
-                    JOIN strike.mv_stocks s ON e.security_code = s.security_code
-                    WHERE e.date_time BETWEEN '{start_date}' AND '{end_date}'
-                    AND e.close > 0
-                    ORDER BY e.date_time DESC
-                )
-                SELECT * FROM ordered_data
-            """
-            
-            logger.info(f"Loading all {total_records:,} records at once")
-            result = pool.execute_query(query)
-            
-            if not result:
-                logger.warning("No data returned from query")
-                return
-                
-            # Convert to DataFrame and load into DuckDB
-            df = pl.DataFrame(result)
-            if len(df) > 0:
-                # Convert to Arrow and load into DuckDB
-                df_arrow = df.to_arrow()
-                with get_duckdb_connection() as conn:
-                    conn.execute("""
-                        CREATE TABLE IF NOT EXISTS public.eod_stock_data (
-                            created_at TIMESTAMP,
-                            symbol VARCHAR,
-                            close_price DECIMAL(18,2),
-                            security_code VARCHAR,
-                            previous_close DECIMAL(18,2),
-                            ticker VARCHAR
-                        )
-                    """)
-                    conn.execute("INSERT INTO public.eod_stock_data SELECT * FROM df_arrow")
-                    logger.info(f"Loaded {len(df):,} EOD records into DuckDB")
-            
-            logger.info(f"Successfully loaded {len(df):,} records")
-            
+
+            # Load data in chunks
+            chunk_size = 100000
+            offset = 0
+            total_loaded = 0
+
+            while offset < total_records:
+                # Query to get data with all required columns
+                query = f"""
+                    WITH ordered_data AS (
+                        SELECT
+                            e.date_time as created_at,
+                            e.close / NULLIF(lagInFrame(e.close) OVER (PARTITION BY s.security_code ORDER BY e.date_time), 0) as ratio,
+                            e.close / NULLIF(avg(e.close) OVER (PARTITION BY s.security_code ORDER BY e.date_time ROWS BETWEEN 20 PRECEDING AND CURRENT ROW), 0) as momentum,
+                            e.close as close_price,
+                            (e.close - NULLIF(lagInFrame(e.close) OVER (PARTITION BY s.security_code ORDER BY e.date_time), 0)) / NULLIF(lagInFrame(e.close) OVER (PARTITION BY s.security_code ORDER BY e.date_time), 0) * 100 as change_percentage,
+                            e.close / NULLIF(avg(e.close) OVER (PARTITION BY s.security_code ORDER BY e.date_time ROWS BETWEEN 5 PRECEDING AND CURRENT ROW), 0) as metric_1,
+                            e.close / NULLIF(avg(e.close) OVER (PARTITION BY s.security_code ORDER BY e.date_time ROWS BETWEEN 10 PRECEDING AND CURRENT ROW), 0) as metric_2,
+                            e.close / NULLIF(avg(e.close) OVER (PARTITION BY s.security_code ORDER BY e.date_time ROWS BETWEEN 15 PRECEDING AND CURRENT ROW), 0) as metric_3,
+                            CASE 
+                                WHEN e.close > lagInFrame(e.close) OVER (PARTITION BY s.security_code ORDER BY e.date_time) THEN 1
+                                WHEN e.close < lagInFrame(e.close) OVER (PARTITION BY s.security_code ORDER BY e.date_time) THEN 2
+                                ELSE 0
+                            END as signal,
+                            s.security_code,
+                            lagInFrame(e.close) OVER (PARTITION BY s.security_code ORDER BY e.date_time) as previous_close,
+                            s.ticker
+                        FROM strike.equity_prices_1d e
+                        JOIN strike.mv_stocks s ON e.security_code = s.security_code
+                        WHERE e.date_time BETWEEN '{start_date}' AND '{end_date}'
+                        AND e.close > 0
+                        ORDER BY e.date_time DESC
+                        LIMIT {chunk_size} OFFSET {offset}
+                    )
+                    SELECT * FROM ordered_data
+                """
+
+                logger.info(f"Executing query for chunk {offset//chunk_size + 1}...")
+                result = ClickHousePool.execute_query(query)
+
+                if not result:
+                    logger.warning(f"No data returned for chunk {offset//chunk_size + 1}")
+                    break
+
+                chunk_records = len(result)
+                total_loaded += chunk_records
+
+                # Calculate and log progress metrics
+                progress = (total_loaded / total_records) * 100
+                logger.info(f"Chunk {offset//chunk_size + 1} loaded: {chunk_records} records")
+                logger.info(f"Total loaded: {total_loaded}/{total_records} records ({progress:.1f}%)")
+
+                # Insert into DuckDB
+                with get_duckdb_connection(self.db_path) as conn:
+                    logger.info(f"Inserting chunk {offset//chunk_size + 1} into DuckDB...")
+                    conn.executemany("""
+                        INSERT OR IGNORE INTO public.eod_stock_data 
+                        (created_at, ratio, momentum, close_price, change_percentage, metric_1, metric_2, metric_3, signal, security_code, previous_close, ticker)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, result)
+                    logger.info(f"Chunk {offset//chunk_size + 1} inserted successfully")
+
+                offset += chunk_size
+
+            logger.info("EOD data load completed:")
+            logger.info(f"Total records loaded: {total_loaded:,}")
+
+            return True
+
         except Exception as e:
-            logger.error(f"Error loading EOD data: {str(e)}")
-            raise
+            logger.error(f"Error loading EOD data: {str(e)}", exc_info=True)
+            return False
 
     async def get_rrg_data(self, request: RrgRequest) -> RrgResponse:
-        """
-        Get RRG data for the specified request.
-        """
-        with TimerMetric("get_rrg_data", "rrg_service"):
-            try:
-                # Validate request
-                if not request.index_symbol or not request.timeframe:
-                    raise ValueError("Index symbol and timeframe are required")
-                
-                # Get tickers from request
-                tickers = request.tickers or []
-                if request.index_symbol not in tickers:
-                    tickers.append(request.index_symbol)
-                
-                # Generate a filename using timestamp and hash
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                tickers_hash = hash("_".join(tickers)) % 10000  # Use last 4 digits of hash
-                filename = f"rrg_{timestamp}_{tickers_hash}"
-                
-                # Use the validated date_range directly
-                date_range = int(request.date_range)  # This is already validated by the schema
-                
-                # Generate CSV data
-                resp = generate_csv(
-                    tickers=tickers,
-                    date_range=date_range,
-                    index_symbol=request.index_symbol,
-                    timeframe=request.timeframe,
-                    channel_name=request.channel_name,
-                    filename=filename,
-                    cache_manager=self.cache_manager
+        """Get RRG data for the specified request"""
+        try:
+            # Generate cache key based on request parameters
+            cache_key = f"rrg_data_{request.index_symbol}_{request.timeframe}_{request.date_range}_{hash(tuple(sorted(request.tickers)))}"
+            
+            # Try to get from cache first
+            cached_data = self.cache_manager.getCache(cache_key)
+            if cached_data:
+                logger.info(f"Cache hit for RRG data: {cache_key}")
+                record_rrg_cache_hit("rrg_data")
+                return RrgResponse(
+                    status="success",
+                    data=json.loads(cached_data),
+                    filename=f"cached_{request.index_symbol}_{request.timeframe}",
+                    cacheHit=True
                 )
+            
+            record_rrg_cache_miss("rrg_data")
+            logger.info(f"Cache miss for RRG data: {cache_key}")
+            
+            with get_duckdb_connection() as conn:
+                # Get index stocks
+                index_query = f"""
+                    SELECT 
+                        security_code,
+                        ticker,
+                        symbol,
+                        company_name as name,
+                        nse_index_name as meaningful_name,
+                        slug,
+                        security_type_code
+                    FROM public.market_metadata 
+                    WHERE symbol = '{request.index_symbol}'
+                """
+                index_result = conn.execute(index_query).fetchdf()
+                logger.info(f"Index query result: {index_result.to_dict('records')}")
                 
-                if not resp:
-                    raise Exception("Failed to generate data")
+                if index_result.empty:
+                    logger.warning(f"Index not found: {request.index_symbol}")
+                    return RrgResponse(
+                        status="error",
+                        data={},
+                        filename="",
+                        error=f"Index not found: {request.index_symbol}"
+                    )
+                
+                # Get price data
+                query = f"""
+                    SELECT 
+                        e.created_at,
+                        e.ratio,
+                        e.momentum,
+                        e.close_price,
+                        e.change_percentage,
+                        e.metric_1,
+                        e.metric_2,
+                        e.metric_3,
+                        e.signal,
+                        e.security_code,
+                        e.previous_close,
+                        s.ticker,
+                        s.symbol,
+                        s.company_name as name,
+                        s.nse_index_name as meaningful_name,
+                        s.slug,
+                        s.security_type_code
+                    FROM public.eod_stock_data e
+                    JOIN public.market_metadata s ON e.security_code = s.security_code
+                    WHERE e.security_code IN ({','.join([f"'{code}'" for code in index_result['security_code'].tolist()])})
+                    AND e.created_at >= CURRENT_DATE - INTERVAL '{request.date_range}' DAY
+                    ORDER BY e.created_at DESC
+                """
+                result = conn.execute(query).fetchdf()
+                logger.info(f"Price data query returned {len(result)} rows")
+                
+                if result.empty:
+                    logger.warning(f"No price data found for stocks in index: {request.index_symbol}")
+                    return RrgResponse(
+                        status="error",
+                        data={},
+                        filename="",
+                        error=f"No price data found for stocks in index: {request.index_symbol}"
+                    )
+                
+                # Transform data into RRG format
+                rrg_data = {
+                    "benchmark": request.index_symbol,
+                    "indexdata": [],
+                    "datalists": [],
+                    "change_data": []
+                }
+                
+                # Process index data first
+                index_data = result[result['ticker'] == request.index_symbol]
+                if not index_data.empty:
+                    index_points = []
+                    for _, row in index_data.iterrows():
+                        index_points.append(str(row['close_price']))
+                    rrg_data["indexdata"] = index_points
+                    logger.info(f"Index data points: {len(index_points)} points")
+                
+                # Process stock data
+                for ticker in request.tickers:
+                    ticker_data = result[result['ticker'] == ticker]
+                    if not ticker_data.empty:
+                        ticker_points = []
+                        for _, row in ticker_data.iterrows():
+                            point = [
+                                row['created_at'].strftime('%Y-%m-%d %H:%M:%S'),
+                                str(row['ratio']),
+                                str(row['momentum']),
+                                str(row['close_price']),
+                                str(row['change_percentage']),
+                                str(row['metric_1']),
+                                str(row['metric_2']),
+                                str(row['metric_3']),
+                                str(row['signal'])
+                            ]
+                            ticker_points.append(point)
+                        
+                        # Get metadata for this ticker
+                        metadata = ticker_data.iloc[0]
+                        datalist = {
+                            "code": metadata['symbol'],
+                            "name": metadata['name'],
+                            "meaningful_name": metadata['meaningful_name'],
+                            "slug": metadata['slug'],
+                            "ticker": ticker,
+                            "symbol": metadata['symbol'],
+                            "security_code": metadata['security_code'],
+                            "security_type_code": float(metadata['security_type_code']),
+                            "data": ticker_points
+                        }
+                        rrg_data["datalists"].append(datalist)
+                        logger.info(f"Added datalist for {ticker} with {len(ticker_points)} points")
+                
+                # Generate change_data
+                start_date = result['created_at'].min()
+                for ticker in request.tickers:
+                    ticker_data = result[result['ticker'] == ticker]
+                    if not ticker_data.empty:
+                        first_day_data = ticker_data[ticker_data['created_at'] == start_date].iloc[0]
+                        change = {
+                            "symbol": ticker,
+                            "created_at": start_date.strftime('%Y-%m-%d'),
+                            "change_percentage": float(first_day_data['change_percentage']) if not pd.isna(first_day_data['change_percentage']) else None,
+                            "close_price": float(first_day_data['close_price']),
+                            "momentum": str(first_day_data['momentum']),
+                            "ratio": str(first_day_data['ratio'])
+                        }
+                        rrg_data["change_data"].append(change)
+                        logger.info(f"Added change data for {ticker}: {change}")
+                
+                # Generate filename
+                filename = f"{request.index_symbol}_{'_'.join(request.tickers)}_{request.timeframe}_{request.date_range}_{datetime.now().strftime('%Y-%m-%dT%H:%M:%S.000Z')}"
+                
+                # Log final response structure
+                logger.info(f"Final RRG response structure:")
+                logger.info(f"- Benchmark: {rrg_data['benchmark']}")
+                logger.info(f"- Number of index points: {len(rrg_data['indexdata'])}")
+                logger.info(f"- Number of datalists: {len(rrg_data['datalists'])}")
+                logger.info(f"- Number of change data entries: {len(rrg_data['change_data'])}")
+                
+                # Cache the RRG data
+                self.cache_manager.setCache(cache_key, json.dumps(rrg_data), expiry_in_minutes=60)  # Cache for 1 hour
                 
                 return RrgResponse(
                     status="success",
-                    data=resp["data"],
-                    filename=filename
+                    data=rrg_data,
+                    filename=filename,
+                    cacheHit=False
                 )
                 
-            except Exception as e:
-                logger.error(f"Failed to generate CSV data: {str(e)}", exc_info=True)
-                raise Exception("Failed to generate data")
+        except Exception as e:
+            logger.error(f"Error getting RRG data: {str(e)}", exc_info=True)
+            return RrgResponse(
+                status="error",
+                data={},
+                filename="",
+                error=f"Error getting RRG data: {str(e)}"
+            )
 
     def _check_apply_pl(self, data_values, meaningful_name):
         """Process daily data using polars operations."""

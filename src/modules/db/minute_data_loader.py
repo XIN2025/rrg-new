@@ -22,6 +22,7 @@ import psutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from src.utils.clickhouse import get_clickhouse_connection
 import pandas as pd
+import pyarrow as pa
 
 logger = get_logger(__name__)
 
@@ -350,6 +351,8 @@ def validate_query_result(result, expected_columns):
 def process_data_in_chunks(query, dd_con, max_retries=3):
     """Process all data at once with enhanced error handling and validation"""
     retry_count = 0
+    start_time = time.time()
+    total_processed = 0
     
     # Match the actual ClickHouse result columns
     expected_columns = [
@@ -362,16 +365,22 @@ def process_data_in_chunks(query, dd_con, max_retries=3):
         if not query.strip() or "SELECT" not in query.upper():
             raise ValueError("Invalid query format")
             
+        logger.info("Executing ClickHouse query...")
         result = ClickHousePool.execute_query(query)
         
         if not result:
             logger.warning("No data returned from query")
             return
             
+        total_records = len(result)
+        logger.info(f"Retrieved {total_records:,} records from ClickHouse")
+        
         # Convert to DataFrame first
+        logger.info("Converting to DataFrame...")
         df = pd.DataFrame(result.result_rows, columns=result.column_names)
         
         # Enhanced data filtering
+        logger.info("Filtering invalid data...")
         df = df.loc[
             (df["current_price"].notna()) &
             (df["previous_close"].notna()) &
@@ -389,77 +398,98 @@ def process_data_in_chunks(query, dd_con, max_retries=3):
             logger.warning("No valid data after filtering")
             return
             
-        # Convert to Arrow and load into DuckDB
-        df_arrow = df.to_arrow()
+        logger.info(f"Valid records after filtering: {len(df):,}")
         
-        # Begin transaction
-        dd_con.execute("BEGIN TRANSACTION")
-        try:
-            # Use a CTE for df_arrow with enhanced validation
-            insert_result = dd_con.execute("""
-                WITH df_arrow AS (
+        # Process in chunks
+        chunk_size = 100000
+        for i in range(0, len(df), chunk_size):
+            chunk = df.iloc[i:i + chunk_size]
+            chunk_num = i // chunk_size + 1
+            total_chunks = (len(df) + chunk_size - 1) // chunk_size
+            
+            logger.info(f"Processing chunk {chunk_num}/{total_chunks}")
+            logger.info(f"Progress: {total_processed}/{len(df)} records ({(total_processed/len(df)*100):.1f}%)")
+            
+            # Convert to Arrow and load into DuckDB
+            logger.info(f"Converting chunk {chunk_num} to Arrow format...")
+            df_arrow = chunk.to_arrow()
+            
+            # Begin transaction
+            logger.info(f"Inserting chunk {chunk_num} into DuckDB...")
+            dd_con.execute("BEGIN TRANSACTION")
+            try:
+                # Use a CTE for df_arrow with enhanced validation
+                insert_result = dd_con.execute("""
+                    WITH df_arrow AS (
+                        SELECT 
+                            ticker,
+                            created_at,
+                            current_price,
+                            previous_close,
+                            security_code,
+                            high_price,
+                            low_price,
+                            volume,
+                            turnover
+                        FROM df_arrow
+                        WHERE 
+                            current_price > 0 AND
+                            previous_close > 0 AND
+                            high_price > 0 AND
+                            low_price > 0 AND
+                            high_price >= low_price AND
+                            created_at IS NOT NULL
+                    )
+                    INSERT INTO public.stock_prices (
+                        ticker, created_at, current_price, previous_close, security_code, high_price, low_price, volume, turnover
+                    )
                     SELECT 
-                        ticker,
-                        created_at,
-                        current_price,
-                        previous_close,
-                        security_code,
-                        high_price,
-                        low_price,
-                        volume,
-                        turnover
+                        ticker, created_at, current_price, previous_close, security_code, high_price, low_price, volume, turnover
                     FROM df_arrow
-                    WHERE 
-                        current_price > 0 AND
-                        previous_close > 0 AND
-                        high_price > 0 AND
-                        low_price > 0 AND
-                        high_price >= low_price AND
-                        created_at IS NOT NULL
-                )
-                INSERT INTO public.stock_prices (
-                    ticker, created_at, current_price, previous_close, security_code, high_price, low_price, volume, turnover
-                )
-                SELECT 
-                    ticker, created_at, current_price, previous_close, security_code, high_price, low_price, volume, turnover
-                FROM df_arrow
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM public.stock_prices s
-                    WHERE s.created_at = df_arrow.created_at
-                    AND s.ticker = df_arrow.ticker
-                )
-            """)
-            
-            inserted_count = insert_result.fetchone()[0]
-            logger.info(f"Inserted {inserted_count} records")
-            
-            # Verify inserted data
-            verify_result = dd_con.execute("""
-                SELECT COUNT(*) 
-                FROM public.stock_prices 
-                WHERE created_at >= (
-                    SELECT MIN(created_at) 
-                    FROM df_arrow
-                )
-            """).fetchone()[0]
-            
-            if verify_result != inserted_count:
-                raise ValueError(f"Data verification failed. Expected {inserted_count} records, got {verify_result}")
-            
-            # Commit transaction
-            dd_con.execute("COMMIT")
-            
-        except Exception as e:
-            # Rollback on error
-            dd_con.execute("ROLLBACK")
-            raise e
-            
-        finally:
-            # Clear memory
-            del df
-            del df_arrow
-            import gc
-            gc.collect()
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM public.stock_prices s
+                        WHERE s.created_at = df_arrow.created_at
+                        AND s.ticker = df_arrow.ticker
+                    )
+                """)
+                
+                inserted_count = insert_result.fetchone()[0]
+                total_processed += inserted_count
+                
+                # Calculate and log progress metrics
+                elapsed_time = time.time() - start_time
+                avg_speed = total_processed / elapsed_time if elapsed_time > 0 else 0
+                estimated_remaining = (len(df) - total_processed) / avg_speed if avg_speed > 0 else 0
+                
+                logger.info(f"Chunk {chunk_num} inserted: {inserted_count} records")
+                logger.info(f"Total processed: {total_processed}/{len(df)} records ({(total_processed/len(df)*100):.1f}%)")
+                logger.info(f"Average speed: {int(avg_speed)} records/sec")
+                logger.info(f"Estimated time remaining: {int(estimated_remaining)} seconds")
+                
+                # Log memory usage
+                process = psutil.Process()
+                memory_info = process.memory_info()
+                logger.info(f"Memory usage: {memory_info.rss / 1024 / 1024:.1f} MB")
+                
+                # Commit transaction
+                dd_con.execute("COMMIT")
+                logger.info(f"Chunk {chunk_num} committed successfully")
+                
+            except Exception as e:
+                # Rollback on error
+                dd_con.execute("ROLLBACK")
+                raise e
+                
+            finally:
+                # Clear memory
+                del chunk
+                del df_arrow
+                import gc
+                gc.collect()
+                
+        logger.info("Data processing completed successfully")
+        logger.info(f"Total records processed: {total_processed}")
+        logger.info(f"Total time: {time.time() - start_time:.2f} seconds")
             
     except Exception as e:
         retry_count += 1
@@ -649,102 +679,171 @@ def process_query_result(result, columns):
         logger.error(f"Error processing query result: {str(e)}")
         return None
 
-def process_batch(query, dd_con):
+def ensure_hourly_stock_data_table(dd_con):
+    dd_con.execute("""
+        CREATE TABLE IF NOT EXISTS hourly_stock_data (
+            ticker VARCHAR,
+            timestamp TIMESTAMP,
+            open_price DOUBLE,
+            high_price DOUBLE,
+            low_price DOUBLE,
+            close_price DOUBLE,
+            volume BIGINT,
+            security_code VARCHAR,
+            symbol VARCHAR
+        )
+    """)
+
+def process_batch(df):
     """Process a batch of data from ClickHouse into DuckDB."""
     try:
-        # Execute the query
-        result = pool.execute_query(query)
-        if not result:
-            logger.warning("No data returned from query")
-            return 0
-
-        # Convert to DataFrame
-        df = pl.DataFrame(result)
         if len(df) == 0:
-            logger.warning("Empty DataFrame after conversion")
+            logger.warning("Empty DataFrame received")
             return 0
 
-        # Convert to Arrow
-        df_arrow = df.to_arrow()
+        # Ensure the data directory exists
+        os.makedirs('data', exist_ok=True)
 
-        # Insert into public.hourly_stock_data using positional column references
-        insert_result = dd_con.execute("""
-            INSERT INTO public.hourly_stock_data (
-                timestamp, symbol, open_price, high_price, low_price, close_price, volume, security_code, ticker
-            )
-            SELECT 
-                column_1 AS timestamp,
-                column_8 AS symbol,
-                column_2 AS open_price,
-                column_3 AS high_price,
-                column_4 AS low_price,
-                column_5 AS close_price,
-                column_6 AS volume,
-                column_7 AS security_code,
-                column_0 AS ticker
-            FROM df_arrow
-        """)
+        logger.info("Connecting to DuckDB...")
+        dd_con = duckdb.connect('data/pydb.duckdb')
+        logger.info("Connected to DuckDB successfully")
 
-        inserted_count = insert_result.fetchone()[0]
-        logger.info(f"Inserted {inserted_count} records into public.hourly_stock_data")
-        return inserted_count
+        # Ensure table exists
+        ensure_hourly_stock_data_table(dd_con)
+
+        # Process in chunks of 100,000 rows
+        chunk_size = 100000
+        total_inserted = 0
+        
+        for i in range(0, len(df), chunk_size):
+            chunk = df.slice(i, chunk_size)
+            logger.info(f"Processing chunk {i//chunk_size + 1} of {(len(df) + chunk_size - 1)//chunk_size}")
+            
+            # Convert to pandas DataFrame for easier manipulation
+            chunk_pd = chunk.to_pandas()
+            
+            # Ensure timestamp is in the correct format
+            chunk_pd['timestamp'] = pd.to_datetime(chunk_pd['timestamp'])
+            
+            # Convert numeric columns
+            numeric_cols = ['open_price', 'high_price', 'low_price', 'close_price', 'volume']
+            for col in numeric_cols:
+                chunk_pd[col] = pd.to_numeric(chunk_pd[col], errors='coerce')
+            
+            # Fill NaN values in volume with 0
+            chunk_pd['volume'] = chunk_pd['volume'].fillna(0).astype('int64')
+            
+            # Drop any rows with NaN values in critical columns
+            critical_cols = ['ticker', 'timestamp', 'open_price', 'high_price', 'low_price', 'close_price']
+            chunk_pd = chunk_pd.dropna(subset=critical_cols)
+            
+            if len(chunk_pd) == 0:
+                logger.warning("No valid data in chunk after cleaning")
+                continue
+
+            logger.info("Converting chunk to Arrow format...")
+            df_arrow = pa.Table.from_pandas(chunk_pd)
+            logger.info("Converted to Arrow format successfully")
+
+            # Insert into hourly_stock_data using named columns
+            logger.info("Inserting data into DuckDB...")
+            insert_result = dd_con.execute("""
+                INSERT INTO hourly_stock_data (
+                    ticker, timestamp, open_price, high_price, low_price, close_price, volume, security_code, symbol
+                )
+                SELECT 
+                    ticker, timestamp, open_price, high_price, low_price, close_price, volume, security_code, symbol
+                FROM df_arrow
+            """)
+
+            inserted_count = insert_result.fetchone()[0]
+            total_inserted += inserted_count
+            logger.info(f"Inserted chunk of {inserted_count} records (total: {total_inserted})")
+
+        logger.info(f"Successfully inserted {total_inserted} records into hourly_stock_data")
+        return total_inserted
 
     except Exception as e:
         logger.error(f"Error processing batch: {str(e)}")
         return 0
 
-def load_hourly_data(days=7):
-    """Load hourly stock data from ClickHouse into DuckDB."""
+def load_hourly_data(days=90):
+    """Load hourly data from ClickHouse into DuckDB."""
     try:
+        logger.info("Initializing ClickHouse connection...")
+        pool = ClickHousePool
+        logger.info("ClickHouse connection initialized successfully")
+
         # Calculate date range
         end_date = datetime.now()
         start_date = end_date - timedelta(days=days)
-        # Format dates as strings for the query
-        start_date_str = start_date.strftime('%Y-%m-%d %H:%M:%S')
-        end_date_str = end_date.strftime('%Y-%m-%d %H:%M:%S')
-        
-        # Define the query
+        logger.info(f"Loading data from {start_date} to {end_date}")
+
+        # Query to get 5-minute interval data with proper table references
         query = f"""
         WITH active_stocks AS (
-            SELECT security_token
+            SELECT security_token, ticker, security_code, symbol
             FROM mv_stocks
         )
-        SELECT
-            s.ticker AS ticker,
-            e.date_time AS timestamp,
-            e.open AS open_price,
-            e.high AS high_price,
-            e.low AS low_price,
-            e.close AS close_price,
-            e.volume AS volume,
-            s.security_code AS security_code,
-            s.symbol AS symbol
-        FROM strike.equity_prices_1min e
-        JOIN strike.mv_stocks s ON e.security_token = s.security_token
-        WHERE e.date_time BETWEEN '{start_date_str}' AND '{end_date_str}'
-        AND e.security_token IN (SELECT security_token FROM active_stocks)
-        AND e.close > 0
-        AND toMinute(e.date_time) % 5 = 0
-        AND e.volume > 0
-        AND e.high >= e.low
-        ORDER BY e.date_time, e.security_token
+        SELECT 
+            ast.ticker,
+            ep.date_time as timestamp,
+            CAST(ep.open AS Float64) as open_price,
+            CAST(ep.high AS Float64) as high_price,
+            CAST(ep.low AS Float64) as low_price,
+            CAST(ep.close AS Float64) as close_price,
+            CAST(ep.volume AS Int64) as volume,
+            ast.security_code,
+            ast.symbol
+        FROM equity_prices_1min AS ep
+        INNER JOIN active_stocks AS ast ON ep.security_token = ast.security_token
+        WHERE ep.date_time >= '{start_date.strftime('%Y-%m-%d')}'
+        AND ep.date_time <= '{end_date.strftime('%Y-%m-%d')}'
+        AND toMinute(ep.date_time) % 5 = 0
+        AND ep.close != 0
+        ORDER BY ast.ticker, ep.date_time
         """
+
+        logger.info("Executing ClickHouse query...")
+        result = pool.execute_query(query)
+        if not result:
+            logger.error("No data returned from ClickHouse")
+            return
+
+        logger.info(f"Retrieved {len(result)} rows from ClickHouse")
         
-        # Process the batch
-        with get_duckdb_connection() as dd_con:
-            if not dd_con:
-                logger.error("Failed to establish DuckDB connection")
-                return False
-            inserted_count = process_batch(query, dd_con)
-            if inserted_count > 0:
-                logger.info(f"Successfully loaded {inserted_count} records into public.hourly_stock_data")
-                return True
-            else:
-                logger.error("No records were inserted")
-                return False
+        # Process in batches
+        batch_size = 1000000
+        total_processed = 0
+        
+        for i in range(0, len(result), batch_size):
+            batch = result[i:i + batch_size]
+            logger.info(f"Processing batch {i//batch_size + 1} of {(len(result) + batch_size - 1)//batch_size}")
+            
+            # Convert batch to DataFrame with explicit column names
+            df = pl.DataFrame(batch, schema={
+                'ticker': pl.Utf8,
+                'timestamp': pl.Datetime,
+                'open_price': pl.Float64,
+                'high_price': pl.Float64,
+                'low_price': pl.Float64,
+                'close_price': pl.Float64,
+                'volume': pl.Int64,
+                'security_code': pl.Utf8,
+                'symbol': pl.Utf8
+            })
+            logger.info(f"Batch DataFrame shape: {df.shape}")
+            
+            # Process the batch
+            inserted = process_batch(df)
+            total_processed += inserted
+            logger.info(f"Processed {total_processed} records so far")
+
+        logger.info(f"Data loading completed. Total records processed: {total_processed}")
+
     except Exception as e:
-        logger.error(f"Error in load_hourly_data: {str(e)}")
-        return False
+        logger.error(f"Error loading hourly data: {str(e)}")
+        raise
 
 def test_queries():
     """Test all queries to ensure they work correctly"""
@@ -868,8 +967,11 @@ def test_queries():
         logger.error(f"Error in test_queries: {str(e)}")
         return False
 
-def load_minute_data(self, start_date: str, end_date: str) -> None:
-    """Load minute data for the specified date range"""
+def load_minute_data(self, start_date: str = None, end_date: str = None) -> None:
+    if start_date is None:
+        start_date = (datetime.now(INDIAN_TZ) - timedelta(days=90)).strftime('%Y-%m-%d')
+    if end_date is None:
+        end_date = datetime.now(INDIAN_TZ).strftime('%Y-%m-%d')
     try:
         # Get total count of records
         count_query = f"""
@@ -905,3 +1007,103 @@ def load_minute_data(self, start_date: str, end_date: str) -> None:
     except Exception as e:
         logger.error(f"Error loading minute data: {str(e)}")
         raise
+
+def test_data_loading():
+    """Test the data loading process with a small sample."""
+    try:
+        logger.info("Starting data loading test...")
+        
+        # Test with a small date range (1 day)
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=1)
+        
+        # Test query with proper table references
+        test_query = f"""
+        WITH active_stocks AS (
+            SELECT security_token, ticker, security_code, symbol
+            FROM mv_stocks
+            LIMIT 10  -- Limit to 10 stocks for testing
+        )
+        SELECT 
+            ast.ticker,
+            ep.date_time as timestamp,
+            CAST(ep.open AS Float64) as open_price,
+            CAST(ep.high AS Float64) as high_price,
+            CAST(ep.low AS Float64) as low_price,
+            CAST(ep.close AS Float64) as close_price,
+            CAST(ep.volume AS Int64) as volume,
+            ast.security_code,
+            ast.symbol
+        FROM equity_prices_1min AS ep
+        INNER JOIN active_stocks AS ast ON ep.security_token = ast.security_token
+        WHERE ep.date_time >= '{start_date.strftime('%Y-%m-%d')}'
+        AND ep.date_time <= '{end_date.strftime('%Y-%m-%d')}'
+        AND toMinute(ep.date_time) % 5 = 0
+        AND ep.close != 0
+        ORDER BY ast.ticker, ep.date_time
+        LIMIT 1000  -- Limit to 1000 records for testing
+        """
+        
+        logger.info("Executing test query...")
+        result = ClickHousePool.execute_query(test_query)
+        
+        if not result:
+            logger.error("No data returned from test query")
+            return False
+            
+        logger.info(f"Retrieved {len(result)} test records")
+        
+        # Convert to DataFrame with explicit schema
+        df = pl.DataFrame(result, schema={
+            'ticker': pl.Utf8,
+            'timestamp': pl.Datetime,
+            'open_price': pl.Float64,
+            'high_price': pl.Float64,
+            'low_price': pl.Float64,
+            'close_price': pl.Float64,
+            'volume': pl.Int64,
+            'security_code': pl.Utf8,
+            'symbol': pl.Utf8
+        })
+        
+        # Verify DataFrame structure
+        logger.info(f"DataFrame shape: {df.shape}")
+        logger.info(f"DataFrame columns: {df.columns}")
+        logger.info(f"DataFrame dtypes: {df.dtypes}")
+        
+        # Test data processing
+        inserted = process_batch(df)
+        logger.info(f"Test batch processing result: {inserted} records inserted")
+        
+        # Verify data in DuckDB
+        dd_con = duckdb.connect('data/pydb.duckdb')
+        ensure_hourly_stock_data_table(dd_con)
+        verify_query = """
+        SELECT 
+            COUNT(*) as total_records,
+            COUNT(DISTINCT ticker) as unique_tickers,
+            MIN(timestamp) as earliest_timestamp,
+            MAX(timestamp) as latest_timestamp
+        FROM hourly_stock_data
+        """
+        
+        verify_result = dd_con.execute(verify_query).fetchone()
+        logger.info(f"Verification results: {verify_result}")
+        
+        # Clean up test data
+        dd_con.execute("DELETE FROM hourly_stock_data WHERE timestamp >= ?", [start_date])
+        logger.info("Test data cleaned up")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Test failed: {str(e)}")
+        return False
+
+if __name__ == "__main__":
+    # Run the test
+    test_success = test_data_loading()
+    if test_success:
+        logger.info("Test completed successfully!")
+    else:
+        logger.error("Test failed!")

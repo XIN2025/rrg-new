@@ -17,9 +17,9 @@ from typing import List, Optional
 
 INDIAN_TZ = "Asia/Kolkata"
 
-# Configure logger to only show errors
+# Configure logger to show INFO level logs
 logger = get_logger("rrg_metadata")
-logger.setLevel(logging.ERROR)
+logger.setLevel(logging.INFO)
 
 # Create a singleton instance
 _metadata_store = None
@@ -65,7 +65,7 @@ class RRGMetadataStore:
         self._eod_stock_data_df = None
         self._price_data_loaded = False
         self._last_price_refresh_time = None
-        self._price_data_days = 3650  # Increased to 10 years to ensure complete historical data
+        self._price_data_days = 3650  # 10 years of historical data
         self._price_data = {}
         self.ensure_metadata_loaded()
 
@@ -73,41 +73,44 @@ class RRGMetadataStore:
         """Internal function to load metadata from DuckDB."""
         try:
             with get_duckdb_connection() as conn:
-                # Query market_metadata table with correct schema and columns
+                # Query market_metadata table with correct schema
                 self._indices_df = conn.sql("""
                     SELECT 
                         security_code, 
-                        company_name as name, 
                         symbol,
                         ticker,
-                        slug
+                        nse_index_name AS company_name,
+                        security_type_code
                     FROM public.market_metadata 
-                    WHERE security_type_code = 5
+                    WHERE symbol IS NOT NULL
+                    AND security_type_code IN ('5', '26')  -- Indices
                 """).pl()
                 
                 self._stocks_df = conn.sql("""
                     SELECT 
                         security_code, 
-                        company_name as name, 
                         symbol,
                         ticker,
-                        slug
+                        company_name,
+                        security_type_code
                     FROM public.market_metadata 
-                    WHERE security_type_code = 26
+                    WHERE symbol IS NOT NULL
+                    AND security_type_code NOT IN ('5', '26')  -- Non-indices
                 """).pl()
                 
-                # Load full market metadata
+                # Load market metadata
                 self._market_metadata_df = conn.sql("""
                     SELECT 
                         security_code,
-                        company_name as name,
                         symbol,
                         ticker,
-                        security_type_code,
-                        slug
+                        COALESCE(company_name, nse_index_name) AS company_name,
+                        security_type_code
                     FROM public.market_metadata
+                    WHERE symbol IS NOT NULL
                 """).pl()
                 
+                logger.info(f"Loaded {len(self._indices_df)} indices, {len(self._stocks_df)} stocks, and {len(self._market_metadata_df)} total market metadata records")
                 return True
         except Exception as e:
             logger.error(f"[RRG Metadata] Error loading metadata: {str(e)}", exc_info=True)
@@ -120,48 +123,29 @@ class RRGMetadataStore:
                 self._price_data_days = days
             
             with get_duckdb_connection() as conn:
-                if not conn:
-                    raise Exception("Failed to establish DuckDB connection")
-
-                # Load index data
-                index_query = f"""
+                # Load EOD stock data
+                eod_query = f"""
                 SELECT 
-                    timestamp as created_at,
-                    symbol,
+                    created_at,
+                    ticker as symbol,
                     close_price,
                     security_code,
                     ticker
-                FROM public.hourly_stock_data
-                WHERE timestamp >= CURRENT_DATE - INTERVAL '{self._price_data_days} days'
+                FROM public.eod_stock_data
+                WHERE created_at >= CURRENT_DATE - INTERVAL '{self._price_data_days} days'
                 AND close_price > 0
-                ORDER BY timestamp ASC
+                ORDER BY created_at ASC
                 """
-                
-                # Load stock data
-                stock_query = f"""
-                SELECT 
-                    timestamp as created_at,
-                    symbol,
-                    close_price,
-                    security_code,
-                    ticker
-                FROM public.hourly_stock_data
-                WHERE timestamp >= CURRENT_DATE - INTERVAL '{self._price_data_days} days'
-                AND close_price > 0
-                ORDER BY timestamp ASC
-                """
-                
-                self._stock_prices_df = conn.execute(stock_query).fetchdf()
-                self._eod_stock_data_df = conn.execute(index_query).fetchdf()
+                self._stock_prices_df = conn.execute(eod_query).fetchdf()
+                self._eod_stock_data_df = self._stock_prices_df.copy()
+                logger.info(f"Loaded {len(self._stock_prices_df)} price records")
                 return True
         except Exception as e:
             logger.error(f"[RRG Price Data] Error loading price data: {str(e)}")
             return False
 
     def ensure_metadata_loaded(self):
-        """
-        Ensures that metadata is loaded if it hasn't been already.
-        """
+        """Ensures that metadata is loaded if it hasn't been already."""
         with TimerMetric("ensure_metadata_loaded", "rrg_metadata"):
             if self._metadata_loaded:
                 return True
@@ -177,12 +161,7 @@ class RRGMetadataStore:
                 return False
 
     def ensure_price_data_loaded(self, days=None):
-        """
-        Ensures that price data is loaded if it hasn't been already.
-        
-        Args:
-            days: Optional number of days of historical data to load
-        """
+        """Ensures that price data is loaded if it hasn't been already."""
         with TimerMetric("ensure_price_data_loaded", "rrg_metadata"):
             if self._price_data_loaded:
                 return True
@@ -198,9 +177,7 @@ class RRGMetadataStore:
                 return False
 
     def refresh_metadata(self):
-        """
-        Forces a refresh of all metadata tables.
-        """
+        """Forces a refresh of all metadata tables."""
         with TimerMetric("refresh_metadata", "rrg_metadata"):
             success = self._load_metadata()
             
@@ -212,48 +189,28 @@ class RRGMetadataStore:
                 logger.error("[RRG Metadata] Failed to refresh metadata")
                 return False
 
-    def refresh_price_data(self, days=None):
-        """
-        Forces a refresh of price data.
-        
-        Args:
-            days: Optional number of days of historical data to load
-        """
-        with TimerMetric("refresh_price_data", "rrg_metadata"):
-            success = self._load_price_data(days)
-            
-            if success:
-                self._price_data_loaded = True
-                self._last_price_refresh_time = datetime.now(timezone.utc)
-                return True
-            else:
-                logger.error("[RRG Price Data] Failed to refresh price data")
-                return False
-
     def get_metadata_status(self):
-        """
-        Returns the current status of metadata loading.
-        """
+        """Returns the current status of metadata loading."""
         return {
             "loaded": self._metadata_loaded,
-            "last_refresh": self._last_refresh_time.isoformat() if self._last_refresh_time else None
+            "last_refresh": self._last_refresh_time.isoformat() if self._last_refresh_time else None,
+            "indices_count": len(self._indices_df) if self._indices_df is not None else 0,
+            "stocks_count": len(self._stocks_df) if self._stocks_df is not None else 0,
+            "market_metadata_count": len(self._market_metadata_df) if self._market_metadata_df is not None else 0
         }
 
     def get_price_data_status(self):
-        """
-        Returns the current status of price data loading.
-        """
+        """Returns the current status of price data loading."""
         return {
             "loaded": self._price_data_loaded,
-            "last_refresh": self._last_price_refresh_time.isoformat() if self._last_price_refresh_time else None
+            "last_refresh": self._last_price_refresh_time.isoformat() if self._last_price_refresh_time else None,
+            "records_count": len(self._stock_prices_df) if self._stock_prices_df is not None else 0
         }
 
     def get_indices(self):
-        """
-        Returns a copy of the indices DataFrame.
-        """
+        """Returns a copy of the indices DataFrame."""
         self.ensure_metadata_loaded()
-        return self._indices_df.clone()
+        return self._indices_df.clone() if self._indices_df is not None else None
 
     def get_indices_stocks(self):
         """
@@ -270,28 +227,24 @@ class RRGMetadataStore:
         return self._companies_df.clone()
 
     def get_stocks(self):
-        """
-        Returns a copy of the stocks DataFrame.
-        """
+        """Returns a copy of the stocks DataFrame."""
         self.ensure_metadata_loaded()
-        return self._stocks_df.clone()
+        return self._stocks_df.clone() if self._stocks_df is not None else None
 
-    def get_market_metadata(self, symbols: List[str]) -> Optional[pl.DataFrame]:
-        """
-        Get market metadata for given symbols.
-        If symbols is None, returns all metadata.
-        """
+    def get_market_metadata(self, symbols: List[str] = None) -> Optional[pl.DataFrame]:
+        """Get market metadata for given symbols. If symbols is None, returns all metadata."""
         try:
             if self._market_metadata_df is None:
                 self.ensure_metadata_loaded()
                 if self._market_metadata_df is None:
                     return None
             
-            # Filter metadata for specified symbols
-            return self._market_metadata_df.filter(pl.col("symbol").is_in(symbols)).clone()
+            if symbols:
+                return self._market_metadata_df.filter(pl.col("symbol").is_in(symbols)).clone()
+            return self._market_metadata_df.clone()
         except Exception as e:
             logger.error(f"Error getting market metadata: {str(e)}", exc_info=True)
-            raise
+            return None
 
     def get_stock_prices(self, symbols, timeframe="daily", filter_days=None):
         """Get stock prices from DuckDB."""
@@ -516,19 +469,11 @@ class RRGMetadataStore:
             logger.info(f"Successfully loaded {len(stocks_df)} stocks")
             
             # Verify market metadata
-            with get_duckdb_connection() as conn:
-                metadata_count = conn.execute("SELECT COUNT(*) FROM public.market_metadata").fetchone()[0]
-                logger.info(f"Market metadata table has {metadata_count} records")
-                
-                # Verify security type codes
-                type_counts = conn.execute("""
-                    SELECT security_type_code, COUNT(*) 
-                    FROM public.market_metadata 
-                    GROUP BY security_type_code
-                """).fetchall()
-                logger.info("Security type code distribution:")
-                for type_code, count in type_counts:
-                    logger.info(f"Type {type_code}: {count} records")
+            market_metadata_df = self.get_market_metadata()
+            if market_metadata_df is None or market_metadata_df.is_empty():
+                logger.error("Failed to load market metadata")
+                return False
+            logger.info(f"Successfully loaded {len(market_metadata_df)} market metadata records")
             
             return True
         except Exception as e:
@@ -538,3 +483,5 @@ class RRGMetadataStore:
 
 
 # 
+
+

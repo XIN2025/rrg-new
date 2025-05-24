@@ -1,12 +1,52 @@
+import sys
+import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..")))
 from datetime import datetime, timedelta
 import time
 import polars as pl
-from modules.rrg.clickhouse_pool import ClickHousePool
-from modules.rrg.logger import logger
+from src.utils.clickhouse_pool import pool
+from src.utils.logger import get_logger
+
+logger = get_logger("eod_data_loader")
 
 def batch_load_eod_stock_data(dd_con, current_time, batch_years=2):
     """Load historical EOD stock data in batches."""
     try:
+        # Ensure table exists
+        dd_con.execute("""
+            CREATE SCHEMA IF NOT EXISTS public;
+        """)
+        dd_con.execute("""
+            CREATE TABLE IF NOT EXISTS public.eod_stock_data (
+                created_at TIMESTAMP,
+                symbol VARCHAR,
+                close_price DOUBLE,
+                security_code VARCHAR,
+                previous_close DOUBLE,
+                ticker VARCHAR,
+                open DOUBLE,
+                high DOUBLE,
+                low DOUBLE,
+                volume DOUBLE
+            );
+        """)
+        # Check if DuckDB table exists and has data
+        table_exists = False
+        try:
+            res = dd_con.execute("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public' AND table_name='eod_stock_data'").fetchone()
+            table_exists = res[0] > 0
+        except Exception as e:
+            logger.info("Table check failed, assuming table does not exist.")
+            table_exists = False
+        if table_exists:
+            try:
+                count = dd_con.execute("SELECT COUNT(*) FROM public.eod_stock_data").fetchone()[0]
+                if count > 0:
+                    logger.info(f"DuckDB already has {count} records in eod_stock_data. Skipping load.")
+                    return True
+            except Exception as e:
+                logger.info("eod_stock_data table exists but count failed, will reload.")
+
         # Calculate batch dates
         end_date = current_time
         start_date = end_date - timedelta(days=365 * batch_years)
@@ -25,22 +65,22 @@ def batch_load_eod_stock_data(dd_con, current_time, batch_years=2):
                 end_date=batch_end.strftime("%Y-%m-%d")
             )
             
-            # Index data query
-            batch_index_query = batch_eod_index_query_template.format(
-                start_date=batch_start.strftime("%Y-%m-%d"),
-                end_date=batch_end.strftime("%Y-%m-%d")
-            )
+            # Index data query (DISABLED)
+            # batch_index_query = batch_eod_index_query_template.format(
+            #     start_date=batch_start.strftime("%Y-%m-%d"),
+            #     end_date=batch_end.strftime("%Y-%m-%d")
+            # )
             
             # Execute queries
-            stock_result = ClickHousePool.execute_query(batch_stock_query)
-            index_result = ClickHousePool.execute_query(batch_index_query)
+            stock_result = pool.execute_query(batch_stock_query)
+            # index_result = pool.execute_query(batch_index_query)
             
             # Convert to DataFrames
             stock_df = pl.DataFrame(stock_result, schema=eod_stock_data_columns, orient="row")
-            index_df = pl.DataFrame(index_result, schema=eod_stock_data_columns, orient="row")
+            # index_df = pl.DataFrame(index_result, schema=eod_stock_data_columns, orient="row")
             
             # Combine data
-            batch_df = pl.concat([stock_df, index_df])
+            batch_df = stock_df # pl.concat([stock_df, index_df])
             
             if len(batch_df) > 0:
                 # Log batch info
@@ -69,14 +109,10 @@ SELECT
     ep.security_code,
     lagInFrame(ep.close) OVER (PARTITION BY ep.security_code ORDER BY ep.date_time) AS previous_close,
     ms.ticker,
-    ms.name,
-    ms.slug,
-    ms.security_type_code,
     ep.open,
     ep.high,
     ep.low,
-    ep.volume,
-    ep.turnover
+    ep.volume
 FROM strike.equity_prices_1d AS ep
 INNER JOIN strike.mv_stocks AS ms 
     ON ep.security_code = ms.security_code
@@ -109,4 +145,25 @@ WHERE ip.date_time > '{start_date}' AND ip.date_time <= '{end_date}'
     AND ip.close > 0  -- Ensure we only get valid prices
     AND ip.volume > 0  -- Ensure we only get valid volumes
 ORDER BY ip.date_time DESC, mi.symbol
-""" 
+"""
+
+eod_stock_data_columns = [
+    "created_at",
+    "symbol",
+    "close_price",
+    "security_code",
+    "previous_close",
+    "ticker",
+    "open",
+    "high",
+    "low",
+    "volume"
+]
+
+if __name__ == "__main__":
+    import duckdb
+    db_path = "data/pydb.duckdb"
+    con = duckdb.connect(db_path)
+    now = datetime.now()
+    batch_load_eod_stock_data(con, now, batch_years=2)
+    con.close() 

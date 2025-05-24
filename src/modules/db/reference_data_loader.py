@@ -1,6 +1,8 @@
 import logging
 import duckdb
 import polars as pl
+import time
+from typing import Optional, Dict, Any, List
 from src.modules.db.db_common import (
     handle_table_data,
     ensure_duckdb_schema,
@@ -16,6 +18,8 @@ from src.utils.clickhouse_pool import pool
 from src.utils.logger import get_logger
 from src.modules.db.config import MAX_RECORDS
 from src.modules.db.metadata_store import RRGMetadataStore
+import os
+from pathlib import Path
 
 # Initialize logger
 logger = logging.getLogger("reference_data_loader")
@@ -52,7 +56,6 @@ indices_stocks_query = """SELECT DISTINCT sc AS security_code
             WHERE sc IS NOT NULL
 """
 
-# Simplified column names in the query - removed trailing semicolons
 metadata_query = """
 SELECT
     cm.company_name as company_name,
@@ -113,6 +116,77 @@ WHERE s.security_type_code IN (5, 26)
   AND s.ticker IS NOT NULL
 """
 
+def verify_table_data(conn, table_name: str, expected_columns: List[str]) -> Dict[str, Any]:
+    """Verify data integrity for a specific table."""
+    try:
+        # Check if table exists
+        table_exists = conn.execute(f"""
+            SELECT COUNT(*) 
+            FROM information_schema.tables 
+            WHERE table_schema = 'public' 
+            AND table_name = '{table_name}'
+        """).fetchone()[0]
+        
+        if not table_exists:
+            return {"error": f"Table {table_name} does not exist"}
+        
+        # Check if all expected columns exist
+        columns = conn.execute(f"""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_schema = 'public' 
+            AND table_name = '{table_name}'
+        """).fetchall()
+        
+        existing_columns = [col[0] for col in columns]
+        missing_columns = [col for col in expected_columns if col not in existing_columns]
+        
+        if missing_columns:
+            return {"error": f"Missing columns in {table_name}: {missing_columns}"}
+        
+        # Check row count
+        count = conn.execute(f"SELECT COUNT(*) FROM public.{table_name}").fetchone()[0]
+        
+        # Check for null values in critical columns
+        null_check = {}
+        for col in expected_columns:
+            null_count = conn.execute(f"""
+                SELECT COUNT(*) 
+                FROM public.{table_name} 
+                WHERE {col} IS NULL
+            """).fetchone()[0]
+            if null_count > 0:
+                null_check[col] = null_count
+        
+        return {
+            "table_name": table_name,
+            "row_count": count,
+            "null_values": null_check,
+            "columns": existing_columns
+        }
+    except Exception as e:
+        logger.error(f"Error verifying table {table_name}: {str(e)}")
+        return {"error": str(e)}
+
+def load_with_retry(func, *args, max_retries: int = 3, **kwargs) -> bool:
+    """Load data with retry mechanism."""
+    for attempt in range(max_retries):
+        try:
+            if attempt > 0:
+                logger.info(f"Retry attempt {attempt + 1} of {max_retries}")
+                time.sleep(2 ** attempt)  # Exponential backoff
+            
+            result = func(*args, **kwargs)
+            if result:
+                return True
+                
+        except Exception as e:
+            logger.error(f"Error in attempt {attempt + 1}: {str(e)}")
+            if attempt == max_retries - 1:
+                return False
+    
+    return False
+
 def add_slug_column_to_table(dd_con, table_name, name_column="name"):
     """
     Add a slug column to an existing table after it has been loaded
@@ -162,80 +236,190 @@ def add_slug_column_to_table(dd_con, table_name, name_column="name"):
         return False
         
 
-def load_companies(force=False):
-    """Load company data into DuckDB"""
+def load_companies(force: bool = False, db_path: Optional[str] = None, dd_con: Optional[duckdb.DuckDBPyConnection] = None) -> bool:
+    """Load company data into DuckDB with verification."""
     logger = get_logger("reference_data_loader")
     try:
-        result = handle_table_data(
-            table_name="companies", 
-            query=company_query, 
-            force=force
-        )
-        logger.info(f"Companies data load {'completed successfully' if result else 'failed'}")
-        return result
+        if dd_con is None:
+            with get_duckdb_connection(db_path) as dd_con:
+                result = handle_table_data(
+                    table_name="companies", 
+                    query=company_query, 
+                    force=force,
+                    expected_columns=companies_columns
+                )
+        else:
+            result = handle_table_data(
+                table_name="companies", 
+                query=company_query, 
+                force=force,
+                expected_columns=companies_columns
+            )
+        
+        if result:
+            # Verify the loaded data
+            verification = verify_table_data(dd_con, "companies", companies_columns)
+            if verification.get("error"):
+                logger.error(f"Data verification failed: {verification}")
+                return False
+            
+            logger.info(f"Companies data load completed: {verification}")
+            return True
+            
+        logger.error("Companies data load failed")
+        return False
+        
     except Exception as e:
         logger.error(f"Error loading companies data: {str(e)}")
         return False
 
 
-def load_stocks(force=False):
-    """Load stocks data into DuckDB"""
+def load_stocks(force: bool = False, db_path: Optional[str] = None, dd_con: Optional[duckdb.DuckDBPyConnection] = None) -> bool:
+    """Load stocks data into DuckDB with verification."""
     logger = get_logger("reference_data_loader")
     try:
-        result = handle_table_data(
-            table_name="stocks", 
-            query=stock_query, 
-            force=force
-        )
-        logger.info(f"Stocks data load {'completed successfully' if result else 'failed'}")
-        return result
+        if dd_con is None:
+            with get_duckdb_connection(db_path) as dd_con:
+                result = handle_table_data(
+                    table_name="stocks", 
+                    query=stock_query, 
+                    force=force,
+                    expected_columns=stocks_columns
+                )
+        else:
+            result = handle_table_data(
+                table_name="stocks", 
+                query=stock_query, 
+                force=force,
+                expected_columns=stocks_columns
+            )
+        
+        if result:
+            # Verify the loaded data
+            verification = verify_table_data(dd_con, "stocks", stocks_columns)
+            if verification.get("error"):
+                logger.error(f"Data verification failed: {verification}")
+                return False
+            
+            logger.info(f"Stocks data load completed: {verification}")
+            return True
+            
+        logger.error("Stocks data load failed")
+        return False
+        
     except Exception as e:
         logger.error(f"Error loading stocks data: {str(e)}")
         return False
 
 
-def load_indices(force=False):
-    """Load indices data into DuckDB"""
+def load_indices(force: bool = False, db_path: Optional[str] = None, dd_con: Optional[duckdb.DuckDBPyConnection] = None) -> bool:
+    """Load indices data into DuckDB with verification."""
     logger = get_logger("reference_data_loader")
     try:
-        result = handle_table_data(
-            table_name="indices", 
-            query=indices_query, 
-            force=force
-        )
-        logger.info(f"Indices data load {'completed successfully' if result else 'failed'}")
-        return result
+        if dd_con is None:
+            with get_duckdb_connection(db_path) as dd_con:
+                result = handle_table_data(
+                    table_name="indices", 
+                    query=indices_query, 
+                    force=force,
+                    expected_columns=indices_columns
+                )
+        else:
+            result = handle_table_data(
+                table_name="indices", 
+                query=indices_query, 
+                force=force,
+                expected_columns=indices_columns
+            )
+        
+        if result:
+            # Verify the loaded data
+            verification = verify_table_data(dd_con, "indices", indices_columns)
+            if verification.get("error"):
+                logger.error(f"Data verification failed: {verification}")
+                return False
+            
+            logger.info(f"Indices data load completed: {verification}")
+            return True
+            
+        logger.error("Indices data load failed")
+        return False
+        
     except Exception as e:
         logger.error(f"Error loading indices data: {str(e)}")
         return False
 
 
-def load_indices_stocks(force=False):
-    """Load indices-stocks data into DuckDB"""
+def load_indices_stocks(force: bool = False, db_path: Optional[str] = None, dd_con: Optional[duckdb.DuckDBPyConnection] = None) -> bool:
+    """Load indices-stocks data into DuckDB with verification."""
     logger = get_logger("reference_data_loader")
     try:
-        result = handle_table_data(
-            table_name="indices_stocks", 
-            query=indices_stocks_query, 
-            force=force
-        )
-        logger.info(f"Indices stocks data load {'completed successfully' if result else 'failed'}")
-        return result
+        if dd_con is None:
+            with get_duckdb_connection(db_path) as dd_con:
+                result = handle_table_data(
+                    table_name="indices_stocks", 
+                    query=indices_stocks_query, 
+                    force=force,
+                    expected_columns=indices_stocks_columns
+                )
+        else:
+            result = handle_table_data(
+                table_name="indices_stocks", 
+                query=indices_stocks_query, 
+                force=force,
+                expected_columns=indices_stocks_columns
+            )
+        
+        if result:
+            # Verify the loaded data
+            verification = verify_table_data(dd_con, "indices_stocks", indices_stocks_columns)
+            if verification.get("error"):
+                logger.error(f"Data verification failed: {verification}")
+                return False
+            
+            logger.info(f"Indices stocks data load completed: {verification}")
+            return True
+            
+        logger.error("Indices stocks data load failed")
+        return False
+        
     except Exception as e:
         logger.error(f"Error loading indices stocks data: {str(e)}")
         return False
 
-def load_market_metadata(force=False):
-    """Load market metadata from ClickHouse into DuckDB"""
+def load_market_metadata(force: bool = False, db_path: Optional[str] = None, dd_con: Optional[duckdb.DuckDBPyConnection] = None) -> bool:
+    """Load market metadata from ClickHouse into DuckDB with verification."""
     logger = get_logger("reference_data_loader")
     try:
-        result = handle_table_data(
-            table_name="market_metadata", 
-            query=metadata_query, 
-            force=force
-        )
-        logger.info(f"Market metadata load {'completed successfully' if result else 'failed'}")
-        return result
+        if dd_con is None:
+            with get_duckdb_connection(db_path) as dd_con:
+                result = handle_table_data(
+                    table_name="market_metadata", 
+                    query=metadata_query, 
+                    force=force,
+                    expected_columns=market_metadata_columns
+                )
+        else:
+            result = handle_table_data(
+                table_name="market_metadata", 
+                query=metadata_query, 
+                force=force,
+                expected_columns=market_metadata_columns
+            )
+        
+        if result:
+            # Verify the loaded data
+            verification = verify_table_data(dd_con, "market_metadata", market_metadata_columns)
+            if verification.get("error"):
+                logger.error(f"Data verification failed: {verification}")
+                return False
+            
+            logger.info(f"Market metadata load completed: {verification}")
+            return True
+            
+        logger.error("Market metadata load failed")
+        return False
+        
     except Exception as e:
         logger.error(f"Error loading market metadata: {str(e)}")
         return False
@@ -282,72 +466,70 @@ def add_indices_names_to_companies(dd_con):
 def add_slug_columns_to_tables(dd_con):
     """Add slug columns to all relevant tables after they've been loaded"""
     try:
+        # Log all tables in public schema
+        tables = dd_con.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'").fetchall()
+        logger.info(f"Tables in public schema: {[t[0] for t in tables]}")
         # Create the UDF only if it doesn't already exist
         try:
             dd_con.execute("SELECT generate_slug('test')")
         except:
             # Only create the function if it doesn't exist
             dd_con.create_function("generate_slug", generate_slug, ["VARCHAR"], "VARCHAR")
-        
         # Add slug to companies table
         companies_result = add_slug_column_to_table(dd_con, "companies", "name")
-        
         # Add slug to indices table 
         indices_result = add_slug_column_to_table(dd_con, "indices", "name")
-        
         # Add slug to market_metadata table using company_name
         metadata_result = add_slug_column_to_table(dd_con, "market_metadata", "company_name")
-        
         all_success = all([companies_result, indices_result, metadata_result])
         logger.info(f"Adding slug columns to tables {'completed successfully' if all_success else 'had some failures'}")
-        
         return all_success
     except Exception as e:
         logger.error(f"Error adding slug columns to tables: {str(e)}")
         return False
 
 
-def load_all_reference_data(force=False):
-    """Load all reference data into DuckDB"""
+def load_all_reference_data(force: bool = False, db_path: Optional[str] = None) -> bool:
+    """Load all reference data into DuckDB using a single direct connection with retries and verification."""
+    import duckdb
     logger = get_logger("reference_data_loader")
     try:
-        # Load all reference data in sequence
-        logger.info("Loading all reference data...")
+        logger.info("Loading all reference data with a single direct connection...")
+        if db_path is None:
+            project_root = Path(__file__).resolve().parents[3]
+            db_path = os.path.join(project_root, "data", "pydb.duckdb")
         
-        # Load companies first
-        if not load_companies(force):
-            logger.error("Failed to load companies data")
-            return False
-            
-        # Load stocks
-        if not load_stocks(force):
-            logger.error("Failed to load stocks data")
-            return False
-            
-        # Load indices
-        if not load_indices(force):
-            logger.error("Failed to load indices data")
-            return False
-            
-        # Load indices stocks
-        if not load_indices_stocks(force):
-            logger.error("Failed to load indices stocks data")
-            return False
-            
-        # Load market metadata
-        if not load_market_metadata(force):
-            logger.error("Failed to load market metadata")
-            return False
-            
-        # Add slug columns to tables
-        with get_duckdb_connection() as conn:
-            if not add_slug_columns_to_tables(conn):
-                logger.error("Failed to add slug columns to tables")
+        conn = duckdb.connect(db_path)
+        logger.info(f"Using direct DuckDB connection id: {id(conn)} and path: {db_path}")
+        
+        # Load each table with retry mechanism
+        load_functions = [
+            (load_companies, "companies"),
+            (load_stocks, "stocks"),
+            (load_indices, "indices"),
+            (load_indices_stocks, "indices_stocks"),
+            (load_market_metadata, "market_metadata")
+        ]
+        
+        for load_func, table_name in load_functions:
+            logger.info(f"Loading {table_name}...")
+            if not load_with_retry(load_func, force, db_path, conn):
+                logger.error(f"Failed to load {table_name} after retries")
+                conn.close()
                 return False
-                
+        
+        logger.info("Committing all changes before adding slug columns...")
+        conn.commit()
+        
+        if not add_slug_columns_to_tables(conn):
+            logger.error("Failed to add slug columns to tables")
+            conn.close()
+            return False
+        
         logger.info("All reference data loaded successfully")
+        conn.close()
         return True
-            
+        
     except Exception as e:
         logger.error(f"Error loading reference data: {str(e)}")
         return False

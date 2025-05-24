@@ -7,9 +7,9 @@ from src.utils.clickhouse import get_clickhouse_connection
 import time as t
 import logging
 
-# Configure logger to only show errors
+# Configure logger to show all logs
 logger = get_logger("rrg_reference_data")
-logger.setLevel(logging.ERROR)
+logger.setLevel(logging.INFO)
 
 class RRGReferenceDataLoader:
     def __init__(self):
@@ -225,6 +225,7 @@ def load_stock_prices(dd_con=None, force=False):
                 security_code
             FROM strike.equity_prices_1min_last_traded
             WHERE ltp > 0
+            LIMIT 10
             """
             logger.info("Executing current stock prices query...")
             current_prices_result = ch_client.query(current_prices_query).result_rows
@@ -240,6 +241,7 @@ def load_stock_prices(dd_con=None, force=False):
                 NULL as symbol
             FROM strike.equity_prices_1d
             WHERE close > 0
+            LIMIT 10
             """
             logger.info("Executing historical stock prices query...")
             historical_prices_result = ch_client.query(historical_prices_query).result_rows

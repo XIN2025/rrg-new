@@ -81,7 +81,7 @@ def update_sync_timestamp(conn, table_name, timestamp, full_refresh_required=Fal
         return False
 
 
-def create_duckdb_table(query: str, table_name: str, conn: duckdb.DuckDBPyConnection) -> bool:
+def create_duckdb_table(query: str, table_name: str, conn: duckdb.DuckDBPyConnection, expected_columns: list = None) -> bool:
     """
     Create a DuckDB table from a ClickHouse query.
     
@@ -89,13 +89,17 @@ def create_duckdb_table(query: str, table_name: str, conn: duckdb.DuckDBPyConnec
         query: Query to execute
         table_name: Name of the table to create
         conn: DuckDB connection
+        expected_columns: List of expected column names (optional)
         
     Returns:
         bool: True if successful, False otherwise
     """
     try:
+        # Create public schema if it doesn't exist
+        conn.execute("CREATE SCHEMA IF NOT EXISTS public")
+        
         # Drop existing table if it exists
-        conn.execute(f"DROP TABLE IF EXISTS {table_name}")
+        conn.execute(f"DROP TABLE IF EXISTS public.{table_name}")
         
         # Get data from ClickHouse
         data = ClickHousePool.execute_query(query)
@@ -103,19 +107,21 @@ def create_duckdb_table(query: str, table_name: str, conn: duckdb.DuckDBPyConnec
             logger.warning(f"⚠️ No data returned for {table_name}")
             return False
             
-        # Create DataFrame and table
+        # Create DataFrame and set columns if needed
         df = pd.DataFrame(data)
         if df.empty:
             logger.warning(f"⚠️ Empty DataFrame for {table_name}")
             return False
+        if expected_columns and len(df.columns) == len(expected_columns):
+            df.columns = expected_columns
             
-        # Create table from DataFrame
-        conn.execute(f"CREATE TABLE {table_name} AS SELECT * FROM df")
-        logger.info(f"✅ Created table {table_name} with {len(df)} rows")
+        # Create table from DataFrame in public schema
+        conn.execute(f"CREATE TABLE public.{table_name} AS SELECT * FROM df")
+        logger.info(f"✅ Created table public.{table_name} with {len(df)} rows")
         return True
         
     except Exception as e:
-        logger.error(f"🚨 Error creating table {table_name}: {str(e)}")
+        logger.error(f"🚨 Error creating table public.{table_name}: {str(e)}")
         return False
 
 
@@ -213,7 +219,7 @@ def should_refresh_table(conn, table_name, force=False):
         return True
 
 
-def handle_table_data(table_name: str, query: str, force: bool = False, timestamp_column: Optional[str] = None) -> bool:
+def handle_table_data(table_name: str, query: str, force: bool = False, timestamp_column: Optional[str] = None, expected_columns: Optional[list] = None) -> bool:
     """
     Handle table data loading with proper connection management.
     
@@ -222,54 +228,52 @@ def handle_table_data(table_name: str, query: str, force: bool = False, timestam
         query: Query to execute
         force: Whether to force a full refresh
         timestamp_column: Optional timestamp column for incremental updates
+        expected_columns: List of expected column names (optional)
         
     Returns:
         bool: True if successful, False otherwise
     """
     try:
-        # Check if table exists
+        # Check if table exists using information_schema
         with get_duckdb_connection() as conn:
-            table_exists = conn.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table_name}'").fetchone() is not None
-            
+            table_exists = conn.execute(f"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name = '{table_name}'").fetchone()[0] > 0
             if not table_exists or force:
-                logger.info(f"🔄 {'Creating' if not table_exists else 'Refreshing'} table {table_name}")
-                return create_duckdb_table(query, table_name, conn)
-            
+                logger.info(f"🔄 {'Creating' if not table_exists else 'Refreshing'} table public.{table_name}")
+                return create_duckdb_table(query, table_name, conn, expected_columns)
             if timestamp_column:
                 # Get latest timestamp from DuckDB
-                latest_ts = conn.execute(f"SELECT MAX({timestamp_column}) FROM {table_name}").fetchone()[0]
+                latest_ts = conn.execute(f"SELECT MAX({timestamp_column}) FROM public.{table_name}").fetchone()[0]
                 if latest_ts:
                     # Add timestamp filter to query
                     query = f"{query} WHERE {timestamp_column} > '{latest_ts}'"
-                    logger.info(f"📅 Incremental update for {table_name} from {latest_ts}")
+                    logger.info(f"📅 Incremental update for public.{table_name} from {latest_ts}")
                 else:
-                    logger.warning(f"⚠️ No timestamp found for {table_name}, performing full refresh")
-                    return create_duckdb_table(query, table_name, conn)
+                    logger.warning(f"⚠️ No timestamp found for public.{table_name}, performing full refresh")
+                    return create_duckdb_table(query, table_name, conn, expected_columns)
             else:
-                logger.info(f"ℹ️ No timestamp column specified for {table_name}, skipping incremental update")
+                logger.info(f"ℹ️ No timestamp column specified for public.{table_name}, skipping incremental update")
                 return True
-                
             # Execute incremental update
             try:
                 data = ClickHousePool.execute_query(query)
                 if data:
                     df = pl.DataFrame(data, schema=column_list, orient="row")
                     if not df.empty:
-                        conn.execute(f"INSERT INTO {table_name} SELECT * FROM df")
-                        logger.info(f"✅ Incremental update completed for {table_name}")
+                        conn.execute(f"INSERT INTO public.{table_name} SELECT * FROM df")
+                        logger.info(f"✅ Incremental update completed for public.{table_name}")
                         return True
                     else:
-                        logger.info(f"ℹ️ No new data for {table_name}")
+                        logger.info(f"ℹ️ No new data for public.{table_name}")
                         return True
                 else:
-                    logger.info(f"ℹ️ No data returned for {table_name}")
+                    logger.info(f"ℹ️ No data returned for public.{table_name}")
                     return True
             except Exception as e:
                 logger.error(f"🚨 Error during incremental update: {str(e)}")
                 return False
                 
     except Exception as e:
-        logger.error(f"🚨 Error handling table {table_name}: {str(e)}")
+        logger.error(f"🚨 Error handling table public.{table_name}: {str(e)}")
         return False
 
 

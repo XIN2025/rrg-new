@@ -8,10 +8,12 @@ from config import API_CONFIG, CORS_CONFIG, LOGGING_CONFIG
 from src.modules.rrg.router import router as rrg_router
 from src.auth.jwt import get_current_user
 from src.utils.manager.cache_manager import CacheManager
-from src.modules.db.data_manager import load_data, clear_duckdb_locks
 from src.utils.logger import configure_logging, get_logger
 from src.modules.rrg.metadata_store import ensure_metadata_loaded, get_metadata_status, ensure_price_data_loaded, get_price_data_status
 from src.utils.metrics import get_metrics, CONTENT_TYPE_LATEST
+from load_historical_data import check_data_exists, load_historical_data
+from src.modules.db.data_manager import clear_duckdb_locks
+from src.modules.db.init_db import init_database
 
 # Configure global logging
 configure_logging(LOGGING_CONFIG.get("level"))
@@ -48,9 +50,39 @@ async def lifespan(app: FastAPI):
         logger.info("Checking for any existing DuckDB locks...")
         clear_duckdb_locks()
 
-        load_data_result = load_data()
-        if not load_data_result:
-            logger.warning("Failed to load reference and EOD data completely, some features may be limited")
+        # Robust DuckDB initialization
+        duckdb_path = 'data/pydb.duckdb'
+        needs_init = False
+        if not os.path.exists(duckdb_path):
+            logger.warning(f"DuckDB file {duckdb_path} does not exist. Will initialize.")
+            needs_init = True
+        else:
+            try:
+                from src.utils.duck_pool import get_duckdb_connection
+                with get_duckdb_connection(duckdb_path) as conn:
+                    count = conn.execute("SELECT COUNT(*) FROM public.market_metadata").fetchone()[0]
+                    if count == 0:
+                        logger.warning("market_metadata table is empty. Will re-initialize DuckDB.")
+                        needs_init = True
+            except Exception as e:
+                logger.error(f"Error checking DuckDB: {e}. Will re-initialize.")
+                needs_init = True
+        if needs_init:
+            logger.info("Initializing DuckDB with metadata from ClickHouse...")
+            if init_database():
+                logger.info("DuckDB initialized successfully.")
+            else:
+                logger.error("DuckDB initialization failed! Application may not work correctly.")
+
+        # Check if data exists and load if needed
+        if not check_data_exists():
+            logger.info("No existing data found. Loading historical data...")
+            if load_historical_data():
+                logger.info("Historical data loaded successfully")
+            else:
+                logger.warning("Failed to load historical data, some features may be limited")
+        else:
+            logger.info("Historical data already exists, skipping load")
 
         time.sleep(1)
         logger.info("DuckDB tables initialization process completed")

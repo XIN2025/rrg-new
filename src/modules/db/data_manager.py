@@ -180,26 +180,22 @@ def ensure_tables_exist():
         logger.error(f"Error ensuring tables exist: {str(e)}")
         return False
 
-def get_duckdb_connection_with_retry(max_retries=5, retry_delay=2):
+def get_duckdb_connection_with_retry(max_retries=5, retry_delay=2, db_path=None):
     """Attempt to get a DuckDB connection with retries"""
-    db_path = get_duckdb_path()
-    logger.debug(f"Using DuckDB path: {db_path}")
-    
+    db_path_actual = db_path if db_path else get_duckdb_path()
+    logger.debug(f"Using DuckDB path: {db_path_actual}")
     for attempt in range(max_retries):
         try:
-            # Try to get a connection using the context manager
-            with get_duckdb_connection() as dd_con:
-                logger.info(f"Successfully connected to DuckDB at {db_path}")
+            with get_duckdb_connection(db_path_actual) as dd_con:
+                logger.info(f"Successfully connected to DuckDB at {db_path_actual}")
                 return dd_con
         except Exception as e:
             logger.warning(f"Connection attempt {attempt+1}/{max_retries} failed: {str(e)}")
             if attempt < max_retries - 1:
                 time.sleep(retry_delay)
             else:
-                logger.error(f"Max retries reached. Could not get DuckDB connection to {db_path}.")
+                logger.error(f"Max retries reached. Could not get DuckDB connection to {db_path_actual}.")
                 return None
-    
-    return None
 
 def is_duckdb_locked(db_path=None):
     """Check if the DuckDB file is locked by another process"""
@@ -271,23 +267,21 @@ def load_data(force=False):
         logger.error(f"Error in load_data: {str(e)}", exc_info=True)
         return False
 
-def load_hourly_data(force=False):
+def load_hourly_data(force=False, db_path=None):
     """Load hourly stock data with improved lock handling"""
     try:
-        db_path = get_duckdb_path()
-        logger.info(f"Starting hourly data load process for {db_path}")
+        db_path_actual = db_path if db_path else get_duckdb_path()
+        logger.info(f"Starting hourly data load process for {db_path_actual}")
         
-        with get_duckdb_connection() as dd_con:
+        with get_duckdb_connection(db_path_actual) as dd_con:
             if not dd_con:
-                logger.error(f"Could not obtain DuckDB connection for hourly data loading on {db_path}")
+                logger.error(f"Could not obtain DuckDB connection for hourly data loading on {db_path_actual}")
                 return False
-            
             try:
                 # Load hourly data 
                 logger.info("Loading hourly stock data...")
                 hourly_result = load_hourly_data_impl(force)  # Use the imported implementation
                 logger.info(f"Hourly data load {'completed successfully' if hourly_result else 'failed'}")
-                
                 return hourly_result
             finally:
                 try:

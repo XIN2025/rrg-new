@@ -12,8 +12,13 @@ import queue
 # Get logger for this module
 logger = logging.getLogger("duck_pool")
 
+# Get absolute path to data directory
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+DEFAULT_DB_PATH = os.path.join(BASE_DIR, 'data', 'pydb.duckdb')
+
 class DuckDBPool:
-    def __init__(self, max_connections=5, timeout=300):  # Increased timeout to 5 minutes
+    def __init__(self, db_path=DEFAULT_DB_PATH, max_connections=5, timeout=300):
+        self.db_path = db_path
         self.pool = queue.Queue(maxsize=max_connections)
         self.max_connections = max_connections
         self.timeout = timeout
@@ -31,7 +36,7 @@ class DuckDBPool:
     def _create_connection(self):
         """Create a new DuckDB connection"""
         try:
-            conn = duckdb.connect('data/pydb.duckdb')
+            conn = duckdb.connect(self.db_path)
             return conn
         except Exception as e:
             logger.error(f"Error creating DuckDB connection: {str(e)}")
@@ -89,19 +94,22 @@ class DuckDBPool:
 
 # Global pool instance
 _pool = None
+_pool_db_path = None
 
 def init_pool(db_path: str = "data/pydb.duckdb", max_connections: int = 5, timeout: int = 30):
-    global _pool
-    if _pool is None:
-        _pool = DuckDBPool(max_connections, timeout)
-        logger.info(f"Initialized DuckDB pool with {max_connections} max connections")
+    global _pool, _pool_db_path
+    if _pool is None or _pool_db_path != db_path:
+        _pool = DuckDBPool(db_path, max_connections, timeout)
+        _pool_db_path = db_path
+        logger.info(f"Initialized DuckDB pool with {max_connections} max connections at {db_path}")
 
 @contextmanager
-def get_duckdb_connection():
-    global _pool
-    if _pool is None:
-        init_pool()
-    
+def get_duckdb_connection(db_path: Optional[str] = None):
+    global _pool, _pool_db_path
+    if _pool is None or (db_path is not None and _pool_db_path != db_path):
+        if db_path is None:
+            db_path = "data/pydb.duckdb"
+        init_pool(db_path)
     conn = None
     try:
         conn = _pool.get_connection()
